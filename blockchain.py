@@ -9,11 +9,11 @@ import hashlib
 class Address:
     def __init__(self):
         self.private_key = ecdsa.SigningKey.generate()
-        self.UTXOs = dict()     # txid : MyUTXO(txid, output_index, value)
+        self.UTXOs = dict()  # txid : MyUTXO(txid, output_index, value)
 
     class MyUTXO:
         def __init__(self, txid, output_index, value):
-            self.txid = txid 
+            self.txid = txid
             self.output_index = output_index
             self.value = value
             self.pending = False
@@ -37,7 +37,7 @@ class Address:
     def clear_pending_transactions(self):
         for UTXO in self.UTXOs.values():
             if UTXO.pending:
-                del UTXOs[UTXO.txid]
+                del self.UTXOs[UTXO.txid]
 
     def gather_UTXOs(self, value):
         remaining_value = value
@@ -51,18 +51,18 @@ class Address:
 
         if remaining_value > 0:
             raise ValueError("Insufficient funds")
-            
+
         return (gathered_UTXO, abs(remaining_value))
 
-    def generate_lock_unlock(self, tx_type = "p2pk"):
+    def generate_lock_unlock(self, tx_type="p2pk"):
         if tx_type == "p2pk":
             locking_script = self.p2pk_locking_script
             unlocking_script = self.p2pk_unlocking_script
 
         return (unlocking_script, locking_script)
 
-    def create_transaction(self, value, reciever_pubkey, tx_type = "p2pk"):
-        unlock, lock = self.generate_lock_unlock(tx_type) 
+    def create_transaction(self, value, receiver_pubkey, tx_type="p2pk"):
+        unlock, lock = self.generate_lock_unlock(tx_type)
         inputs, outputs = [], []
 
         (gathered_UTXO, extra_value) = self.gather_UTXOs(value)
@@ -75,12 +75,12 @@ class Address:
         locking_script_for_change = lock(self.public_key)
 
         outputs.append(TxOutput(value, locking_script))
-        outputs.append(TxOutput(change, locking_script_for_change))
+        outputs.append(TxOutput(extra_value, locking_script_for_change))
 
         return Transaction(inputs, outputs)
 
-    def create_genesis(self, receiver_pubkey, tx_type = "p2pk"):
-        _, lock = self.generate_lock_unlock(tx_type)        
+    def create_genesis(self, receiver_pubkey, tx_type="p2pk"):
+        _, lock = self.generate_lock_unlock(tx_type)
         locking_script = lock(receiver_pubkey)
         return Transaction([], [TxOutput(50, locking_script)])
 
@@ -122,11 +122,10 @@ class Transaction:
         return iterable_hash((hash(io) for io in self.inputs + self.outputs))
 
 
-class BlockHeader:
-    def __init__(self, prev_block_hash, merkle_root_hash):
+class GenesisBlockHeader:
+    def __init__(self, merkle_root_hash):
         self.merkle_root_hash = merkle_root_hash
         self.nonce = 0
-        self.prev_block_hash = prev_block_hash
         self.timestamp = time.time()
 
     def increment_nonce(self):
@@ -137,8 +136,29 @@ class BlockHeader:
             self.increment_nonce()
 
     @staticmethod
-    def has_proof_of_work(self):
-        return int.from_bytes(hash(self)) < 10 ** 7
+    def has_proof_of_work():
+        # return int.from_bytes(hash(self)) < 10 ** 7
+        return True
+
+    def __hash__(self):
+        return iterable_hash(
+            (
+                self.merkle_root_hash,
+                self.nonce._to_bytes(),
+                self.timestamp.to_bytes(),
+            )
+        )
+
+    def __str__(self):
+        return "Merkle_Root: {}, Nonce: {}, Timestamp: {}".format(
+            self.merkle_root_hash, self.nonce, self.timestamp
+        )
+
+
+class BlockHeader(GenesisBlockHeader):
+    def __init__(self, prev_block_hash, merkle_root_hash):
+        self.prev_block_hash = prev_block_hash
+        super().__init__(merkle_root_hash)
 
     def __hash__(self):
         return iterable_hash(
@@ -150,12 +170,25 @@ class BlockHeader:
             )
         )
 
+    def __str__(self):
+        return "Previous Block Hash: {}, {}".format(
+            self.prev_block_hash, super().__str__()
+        )
+
 
 class Block:
-    def __init__(self, prev_block_hash, transactions):
+    def __init__(self, transactions, prev_block_hash=None):
+        self.is_genesis = prev_block_hash is None
         self.transactions = transactions
         self.transactions_merkle = merklelib.MerkleTree(transactions)
-        self.header = BlockHeader(prev_block_hash, self.transactions.merkle_hash)
+
+        if self.is_genesis:
+            self.header = GenesisBlockHeader(self.transactions_merkle.merkle_root)
+        else:
+            self.header = BlockHeader(
+                prev_block_hash, self.transactions_merkle.merkle_root
+            )
+
         self.header.proof_of_work()
 
     def contains_txid(self, txid):
@@ -171,10 +204,13 @@ class Block:
         # this defines a unique hash for each block
         return hash(self.header)
 
+    def __str__(self):
+        return self.header.__str__()
+
 
 class BlockChain:
-    def __init__(self):
-        self.chain = []
+    def __init__(self, genesis_block):
+        self.chain = [genesis_block]
 
     def add_block(self, block):
         self.chain.append(block)
@@ -187,6 +223,9 @@ class BlockChain:
 
     def head(self):
         return self.chain[-1]
+
+    def __str__(self):
+        return "\n".join(block.__str__() for block in self.chain)
 
 
 class InvalidBlock(Exception):
@@ -210,19 +249,21 @@ class FullNode:
             self.update_UTXO_set(block)
 
     def update_UTXO_set(self, block):
+        if not self.validate_block(block):
+            raise InvalidBlock(block)
+
         for tx in block.transactions:
-            try:
-                for tx_in in tx.inputs:
-                    del UTXO_set[hash(tx_in)]
+            for txi in tx.inputs:
+                del self.UTXO_set[hash(txi)]
 
-                for tx_out in tx.outputs:
-                    UTXO_set[hash(tx_out)] = tx_out
+            for txo in tx.outputs:
+                self.UTXO_set[hash(txo)] = txo
 
-            except KeyError:
-                raise InvalidBlock(block)
-
-    def init_UTXO_set():
-        pass
+    def init_UTXO_set(self):
+        self.UTXO_set = set()
+        for tx in self.blockchain.chain[0].transactions:
+            for txo in tx.outputs:
+                self.UTXO_set[hash(txo)] = txo
 
     def validate_block(self, block):
         if not self.blockchain.fits_blockchain_head(block):
@@ -242,12 +283,14 @@ class FullNode:
         # Collect sum of UTXO value
         for txi in tx.inputs:
             # Check that the tx is in the UTXO_set
-            if not txi.prev_txid in UTXO_set:
+            if txi.prev_txid not in self.UTXO_set:
                 return False
 
             # Verify that the unlocking script unlocks the locking script
-            prev_txo = UTXO_set[txi.prev_txid].outputs[txi.output_index]
-            if not p2pk_verify(prev_txo.locking_script, txi.unlocking_script):
+            prev_txo = self.UTXO_set[txi.prev_txid].outputs[txi.output_index]
+            if not self.verify_lock_unlock(
+                prev_txo.locking_script, txi.unlocking_script
+            ):
                 return False
 
             # Collect the value of the previous output as cash on hand
@@ -258,6 +301,12 @@ class FullNode:
             cash -= txo.value
 
         return cash >= 0
+
+    def verify_lock_unlock(self, locking_script, unlocking_script, tx_type="p2pk"):
+        if tx_type == "p2pk":
+            return locking_script.verify(unlocking_script, locking_script)
+        else:
+            return True
 
 
 class Miner:
@@ -274,3 +323,16 @@ class Miner:
 
     def create_block(self, transactions):
         return Block(self.blockchain.head(), transactions)
+
+
+if __name__ == "__main__":
+    ad1, ad2 = Address(), Address()
+    genesis_block = Block([ad1.create_genesis(ad2.public_key)])
+    bc = BlockChain(genesis_block)
+    print(bc)
+
+    miner = Miner(bc)
+    txs = [ad2.create_transaction(2, ad1.public_key()) for _ in range(10)]
+    blk = miner.create_block(txs)
+    miner.add_block(blk)
+    print(bc)
