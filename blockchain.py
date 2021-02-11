@@ -18,7 +18,7 @@ class Address:
             self.value = value
             self.pending = False
 
-    def public_key(self):
+    def get_public_key(self):
         return self.private_key.verifying_key
 
     def sign(self, byte_string):
@@ -27,8 +27,8 @@ class Address:
     def p2pk_locking_script(self, receiver_pubkey):
         return receiver_pubkey
 
-    def p2pk_unlocking_script(self, UTXO):
-        return self.sign(self.public_key)
+    def p2pk_unlocking_script(self):
+        return self.sign(self.get_public_key().to_string())
 
     def reset_pending_transactions(self):
         for UTXO in self.UTXOs.values():
@@ -54,12 +54,9 @@ class Address:
 
         return (gathered_UTXO, abs(remaining_value))
 
-    def generate_lock_unlock(self, tx_type="p2pk"):
+    def generate_lock_unlock(self, receiver_pubkey, tx_type="p2pk"):
         if tx_type == "p2pk":
-            locking_script = self.p2pk_locking_script
-            unlocking_script = self.p2pk_unlocking_script
-
-        return (unlocking_script, locking_script)
+            return (self.p2pk_unlocking_script, self.p2pk_locking_script)
 
     def create_transaction(self, value, receiver_pubkey, tx_type="p2pk"):
         unlock, lock = self.generate_lock_unlock(tx_type)
@@ -72,7 +69,7 @@ class Address:
             inputs.append(TxInput(UTXO, unlocking_script))
 
         locking_script = lock(receiver_pubkey)
-        locking_script_for_change = lock(self.public_key)
+        locking_script_for_change = lock(self.get_public_key)
 
         outputs.append(TxOutput(value, locking_script))
         outputs.append(TxOutput(extra_value, locking_script_for_change))
@@ -84,14 +81,25 @@ class Address:
         locking_script = lock(receiver_pubkey)
         return Transaction([], [TxOutput(50, locking_script)])
 
+    def clear_transactions(self, success=True):
+        for txid, UTXO in self.UTXOs.items():
+            if UTXO.pending:
+                if success:
+                    del self.UTXOs[txid]
+                else:
+                    UTXO.pending = False
 
-def iterable_hash(self, hashable_it):
+    def incoming_tx(self, tx, output_index):
+        self.UTXOs[hash(tx)] = self.MyUTXO(hash(tx), output_index, tx.outputs[output_index].value)
+
+
+def iterable_hash(hashable):
     """Helper function which constructs a hash from an iterable list of hashable items"""
     m = hashlib.sha256()
-    for item in hashable_it:
+    for item in hashable:
         m.update(item)
 
-    return m.digest()
+    return int.from_bytes(m.digest(), "big")
 
 
 class TxInput:
@@ -110,7 +118,7 @@ class TxOutput:
         self.locking_script = locking_script
 
     def __hash__(self):
-        return iterable_hash((self.value.to_bytes(), self.locking_script))
+        return iterable_hash((self.value.to_bytes(4, 'big'), self.locking_script.to_string()))
 
 
 class Transaction:
@@ -119,14 +127,14 @@ class Transaction:
         self.outputs = outputs
 
     def __hash__(self):
-        return iterable_hash((hash(io) for io in self.inputs + self.outputs))
+        return iterable_hash(hash(io).to_bytes(10, 'big') for io in self.inputs + self.outputs)
 
 
 class GenesisBlockHeader:
     def __init__(self, merkle_root_hash):
         self.merkle_root_hash = merkle_root_hash
         self.nonce = 0
-        self.timestamp = time.time()
+        self.timestamp = int(time.time())
 
     def increment_nonce(self):
         self.nonce += 1
@@ -144,8 +152,8 @@ class GenesisBlockHeader:
         return iterable_hash(
             (
                 self.merkle_root_hash,
-                self.nonce._to_bytes(),
-                self.timestamp.to_bytes(),
+                self.nonce.to_bytes(4, 'big'),
+                self.timestamp.to_bytes(4, 'big')
             )
         )
 
@@ -164,9 +172,9 @@ class BlockHeader(GenesisBlockHeader):
         return iterable_hash(
             (
                 self.merkle_root_hash,
-                self.prev_block_hash,
-                self.nonce._to_bytes(),
-                self.timestamp.to_bytes(),
+                self.prev_block_hash.to_bytes(10, 'big'),
+                self.nonce.to_bytes(4, 'big'),
+                self.timestamp.to_bytes(4, 'big'),
             )
         )
 
@@ -183,10 +191,10 @@ class Block:
         self.transactions_merkle = merklelib.MerkleTree(transactions)
 
         if self.is_genesis:
-            self.header = GenesisBlockHeader(self.transactions_merkle.merkle_root)
+            self.header = GenesisBlockHeader(self.transactions_merkle.merkle_root.encode())
         else:
             self.header = BlockHeader(
-                prev_block_hash, self.transactions_merkle.merkle_root
+                prev_block_hash, self.transactions_merkle.merkle_root.encode()
             )
 
         self.header.proof_of_work()
@@ -305,8 +313,7 @@ class FullNode:
     def verify_lock_unlock(self, locking_script, unlocking_script, tx_type="p2pk"):
         if tx_type == "p2pk":
             return locking_script.verify(unlocking_script, locking_script)
-        else:
-            return True
+        return True
 
 
 class Miner:
@@ -322,17 +329,21 @@ class Miner:
         self.blockchain.add_block(block)
 
     def create_block(self, transactions):
-        return Block(self.blockchain.head(), transactions)
+        return Block(transactions, hash(self.blockchain.head()))
 
 
-if __name__ == "__main__":
-    ad1, ad2 = Address(), Address()
-    genesis_block = Block([ad1.create_genesis(ad2.public_key)])
-    bc = BlockChain(genesis_block)
-    print(bc)
+ad1, ad2 = Address(), Address()
+genesis_block = Block([ad1.create_genesis(ad2.get_public_key())])
+bc = BlockChain(genesis_block)
+print("Blockchain after genesis:")
+print(bc)
 
-    miner = Miner(bc)
-    txs = [ad2.create_transaction(2, ad1.public_key()) for _ in range(10)]
-    blk = miner.create_block(txs)
-    miner.add_block(blk)
-    print(bc)
+ad1.clear_pending_transactions()
+ad2.incoming_tx(genesis_block.transactions[0], 0)
+miner = Miner(bc)
+txs = [ad2.create_transaction(2, ad1.get_public_key()) for _ in range(10)]
+blk = miner.create_block(txs)
+# print(blk)
+miner.add_block(blk)
+print("\n\nBlockchain after 2 blocks:")
+print(bc)
