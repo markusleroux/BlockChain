@@ -9,7 +9,7 @@ import hashlib
 class Address:
     def __init__(self):
         self.private_key = ecdsa.SigningKey.generate()
-        self.UTXOs = dict()  # txid : MyUTXO(txid, output_index, value)
+        self.myUTXOs = dict()  # txid : MyUTXO(txid, output_index, value)
 
     class MyUTXO:
         def __init__(self, txid, output_index, value):
@@ -19,6 +19,8 @@ class Address:
             self.pending = False
 
     def get_public_key(self):
+        # Returns a VerifyKey object
+        # Use .to_string() method for (hashable) string
         return self.private_key.verifying_key
 
     def sign(self, byte_string):
@@ -31,18 +33,21 @@ class Address:
         return self.sign(self.get_public_key().to_string())
 
     def reset_pending_transactions(self):
-        for UTXO in self.UTXOs.values():
+        for UTXO in self.myUTXOs.values():
             UTXO.pending = False
 
+    def clear_pending_tx(self, txid):
+        del self.myUTXOs[txid]
+
     def clear_pending_transactions(self):
-        for UTXO in self.UTXOs.values():
+        for UTXO in self.myUTXOs.values():
             if UTXO.pending:
-                del self.UTXOs[UTXO.txid]
+                del self.myUTXOs[UTXO.txid]
 
     def gather_UTXOs(self, value):
         remaining_value = value
         gathered_UTXO = set()
-        for UTXO in self.UTXOs.values():
+        for UTXO in self.myUTXOs.values():
             if remaining_value <= 0:
                 break
 
@@ -76,21 +81,24 @@ class Address:
 
         return Transaction(inputs, outputs)
 
-    def create_genesis(self, receiver_pubkey, tx_type="p2pk"):
+    def create_genesis_tx(self, receiver_pubkey, tx_type="p2pk"):
         _, lock = self.generate_lock_unlock(tx_type)
         locking_script = lock(receiver_pubkey)
         return Transaction([], [TxOutput(50, locking_script)])
 
     def clear_transactions(self, success=True):
-        for txid, UTXO in self.UTXOs.items():
+        for txid, UTXO in self.myUTXOs.items():
             if UTXO.pending:
                 if success:
-                    del self.UTXOs[txid]
+                    del self.myUTXOs[txid]
                 else:
                     UTXO.pending = False
 
-    def incoming_tx(self, tx, output_index):
-        self.UTXOs[hash(tx)] = self.MyUTXO(hash(tx), output_index, tx.outputs[output_index].value)
+    def incoming_tx(self, txid, output_index, value):
+        self.myUTXOs[txid] = self.MyUTXO(txid, output_index, value)
+
+    def __hash__(self):
+        return hash(self.get_public_key().to_string())
 
 
 def iterable_hash(hashable):
@@ -179,8 +187,8 @@ class BlockHeader(GenesisBlockHeader):
         )
 
     def __str__(self):
-        return "Previous Block Hash: {}, {}".format(
-            self.prev_block_hash, super().__str__()
+        return "{}, Previous Block Hash: {}".format(
+            super().__str__(), self.prev_block_hash
         )
 
 
@@ -250,6 +258,7 @@ class FullNode:
     def __init__(self, blockchain):
         self.blockchain = blockchain
         self.build_UTXO_set()
+        self.build_tx_lookup()
 
     def build_UTXO_set(self):
         self.UTXO_set = self.init_UTXO_set()
@@ -262,7 +271,7 @@ class FullNode:
 
         for tx in block.transactions:
             for txi in tx.inputs:
-                del self.UTXO_set[hash(txi)]
+                del self.UTXO_set[txi.prev_txid]
 
             for txo in tx.outputs:
                 self.UTXO_set[hash(txo)] = txo
@@ -277,7 +286,17 @@ class FullNode:
         if not self.blockchain.fits_blockchain_head(block):
             return False
 
+        spent_utxo = set()
         for tx in block.transactions:
+            # Check that not input is not included in a transaction earlier
+            # in the block we are currently considering
+            for txi in tx.inputs:
+                if (txi.prev_txid, txi.output_index) in spent_utxo:
+                    return False
+                spent_utxo.add((txi.prev_txid, txi.output_index))
+
+            # Check that it contains enough funds, that the locking and
+            # unlocking scripts match and that the txo in the input is unspent
             if not self.validate_tx(tx):
                 return False
 
@@ -290,7 +309,7 @@ class FullNode:
         # Verify all inputs have unlocking script for corresponding output locking script
         # Collect sum of UTXO value
         for txi in tx.inputs:
-            # Check that the tx is in the UTXO_set
+            # Check that the txo is in the UTXO_set
             if txi.prev_txid not in self.UTXO_set:
                 return False
 
@@ -317,8 +336,14 @@ class FullNode:
 
 
 class Miner:
-    def __init__(self, blockchain):
-        self.blockchain = blockchain
+    def __init__(self, blockchain=None):
+        self.address = Address()
+        if not blockchain:
+            # Create genesis_block
+            genesis_tx = self.address.create_genesis_tx(self.address.get_public_key())
+            self.blockchain = BlockChain(Block([genesis_tx]))
+        else:
+            self.blockchain = blockchain
 
     def add_block(self, block):
         # Assumes the transactions on the block are valid
@@ -332,8 +357,63 @@ class Miner:
         return Block(transactions, hash(self.blockchain.head()))
 
 
+class NetworkControl:
+    def __init__(self, n_miners, n_addresses, n_full_nodes):
+        self.addresses = {hash(ad): ad for ad in (Address() for _ in range(n_addresses))}
+
+        self.miners = set()
+        genesis_miner = self.add_miner()
+        for _ in range(n_miners):
+            _ = self.add_miner(genesis_miner.blockchain)
+
+        self.full_nodes = set()
+        for _ in range(n_full_nodes):
+            self.add_full_node(genesis_miner.blockchain)
+
+        self.tx_queue = []
+
+    def add_miner(self, blockchain=None):
+        miner = Miner(blockchain)
+        self.addresses[hash(miner.address)] = miner.address
+        self.miners.add(miner)
+        return miner
+
+    def add_full_node(self, blockchain):
+        self.full_nodes.add(FullNode(blockchain))
+
+    def enqueue_tx(self, tx):
+        self.tx_queue.append(tx)
+
+    def dequeue_txs(self, n):
+        for tx in self.tx_queue[:n]:
+            self.notify(tx)
+
+        self.tx_queue = self.tx_queue[n:]
+
+    def notify(self, tx):
+        for txi in tx.inputs:
+            sender = self.get_owner_address(txi)
+            self.notify_sender(sender, txi.prev_txid, hash(tx))
+
+        for output_index, txo in enumerate(tx.outputs):
+            receiver = self.get_receiver_address(txo)
+            self.notify_reveiver(receiver, hash(tx), output_index, txo.value)
+
+    def notify_sender(self, sender, prev_txid, txid):
+        NotImplemented
+
+    def notifiy_receiver(self, txid, output_index, value):
+        NotImplemented
+
+    def get_owner_address(self, txi):
+        NotImplemented
+
+    def get_receiver_address(self, txo):
+        NotImplemented
+
+
 ad1, ad2 = Address(), Address()
-genesis_block = Block([ad1.create_genesis(ad2.get_public_key())])
+genesis_block = Block([ad1.create_genesis_tx(ad2.get_public_key())])
 bc = BlockChain(genesis_block)
 print("Blockchain after genesis:")
 print(bc)
