@@ -17,6 +17,8 @@ import ecdsa                                                # eliptic curve keys
 
 TxID = int
 HeaderHash = int
+BlockHeight = int
+OutputIndex = int
 
 
 def sha256_hash(item: bytes) -> int:
@@ -29,13 +31,13 @@ class LockingScript:
     pubkey: bytes
     tx_type: str = "p2pk"
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         if self.tx_type == "p2pk":
             return self.pubkey
         else:
             raise NotImplementedError
 
-    def unlock(self, unlocking_script: UnlockingScript):
+    def unlock(self, unlocking_script: UnlockingScript) -> bool:
         if unlocking_script.tx_type != self.tx_type:
             return False
 
@@ -54,7 +56,7 @@ class UnlockingScript:
     def __post_init__(self, private_key):
         self.signature = private_key.sign(self.pubkey)
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         if self.tx_type == "p2pk":
             return self.signature
         else:
@@ -79,7 +81,7 @@ class TxInput:
     def __post_init__(self, utxo: UTXO):
         '''Get the txid and output_index from UTXO and discard UTXO'''
         self.prev_txid: TxID = utxo.txid
-        self.output_index: int = utxo.output_index
+        self.output_index: OutputIndex = utxo.output_index
 
     def __hash__(self):
         return sha256_hash(
@@ -100,6 +102,9 @@ class Transaction:
         result += reduce(operator.add, (hash(o).to_bytes(10, 'big') for o in self.outputs), b'0')
         return sha256_hash(result)
 
+    def __str__(self):
+        return "INPUTS:\n" + "\n".join(str(i) for i in self.inputs) + "\nOUTPUTS:\n" + "\n".join(str(o) for o in self.outputs)
+
 
 class BloomFilter:
     '''Bloom filters allow for efficient descriptions of subsets of transactions.
@@ -117,7 +122,10 @@ class BloomFilter:
         '''Add an item (tx or pubkey) to the filter.'''
         for i in range(self.n_hashes):
             # Index error?
-            self.bitarray[mmh3.hash(item, i)] = True
+            if isinstance(item, TxID):
+                self.bitarray[mmh3.hash(item.to_bytes(8, 'big'), i)] = True
+            else:
+                self.bitarray[mmh3.hash(item, i)] = True
 
     def check(self, item: Union[TxID, bytes]) -> bool:
         '''Check if an item is in the filter.'''
@@ -149,7 +157,7 @@ class BloomFilter:
         return int(S * N * math.log(2) / 8)
 
 
-BloomResponseType = dict[Union[TxID, bytes], tuple[int, Transaction, merklelib.AuditProof]]
+BloomResponseType = dict[Union[TxID, bytes], tuple[BlockHeight, Transaction, merklelib.AuditProof]]
 
 
 class SimplifiedPaymentVerification:
@@ -190,8 +198,9 @@ class SimplifiedPaymentVerification:
         if isinstance(item, TxID):
             try:
                 height, _, proof = proofs[item]
-                prev_block_hash = self.headers[height].prev_block_hash
-                return merklelib.verify_leaf_inclusion(item, proof, merklelib.Hasher(), prev_block_hash)
+                return merklelib.verify_leaf_inclusion(item, proof,
+                                                    merklelib.Hasher(),
+                                                    hash(self.headers[height]))
             except KeyError:
                 print("Transaction not in collection of proofs.")
                 return False
@@ -199,8 +208,9 @@ class SimplifiedPaymentVerification:
         elif isinstance(item, bytes):
             try:
                 height, tx, proof = proofs[item]
-                prev_block_hash = self.headers[height].prev_block_hash
-                if not merklelib.verify_leaf_inclusion(hash(tx), proof, merklelib.Hasher(), prev_block_hash):
+                if not merklelib.verify_leaf_inclusion(hash(tx), proof,
+                                                      merklelib.Hasher(),
+                                                      hash(self.headers[height])):
                     return False
 
                 # AT LEAST one matching pubkey in tx
@@ -210,12 +220,13 @@ class SimplifiedPaymentVerification:
                 print("Pubkey not in colection of proofs.")
                 return False
 
+
 @dataclass
 class UTXO:
     txid: TxID
-    output_index: int
+    output_index: OutputIndex
     value: float = field(hash=False)
-    _pending: Optional[TxID] = field(default=None, init=False)         # store the txid of the spending tx 
+    _pending: Optional[TxID] = field(default=None, init=False)         # store the txid of the spending tx
 
 
 class Address(SimplifiedPaymentVerification):
@@ -341,14 +352,14 @@ class BlockHeader:
 
     def __hash__(self) -> HeaderHash:
         result = reduce(operator.add, (self.merkle_root_hash,
-                                       self.nonce.to_bytes(4, 'big'),
-                                       self.timestamp.to_bytes(4, 'big'),
-                                       self.prev_block_hash.to_bytes(4, 'big')))
+                                       self.nonce.to_bytes(10, 'big'),
+                                       self.timestamp.to_bytes(10, 'big'),
+                                       self.prev_block_hash.to_bytes(10, 'big')))
 
         return sha256_hash(result)
 
     def __str__(self):
-        return "Merkle_Root: {}, Nonce: {}, Timestamp: {}, Previous Block Hash: {}".format(self.merkle_root_hash,
+        return "Merkle_Root: {},\nNonce: {},\nTimestamp: {},\nPrevious Block Hash: {}".format(self.merkle_root_hash,
                                                                                       self.nonce,
                                                                                       self.timestamp,
                                                                                       self.prev_block_hash)
@@ -364,7 +375,7 @@ class InvalidBlock(Exception):
     def __str__(self):
         return f"{self.block_hash}: {self.message}"
 
- 
+
 class Block:
     def __init__(self, transactions: Sequence[Transaction], prev_block_hash = None):
         self._transactions: list[Transaction] = list(transactions)
@@ -374,7 +385,7 @@ class Block:
             # Genesis block contains one tx and dummy prev_block_hash
             self.header = BlockHeader(self.transactions_merkle.merkle_root.encode(), 0)
         elif prev_block_hash is not None and len(transactions) >= 1:
-            self.header = BlockHeader(self.transactions_merkle.merkle_root.encoide(), prev_block_hash)
+            self.header = BlockHeader(self.transactions_merkle.merkle_root.encode(), prev_block_hash)
         else:
             raise ValueError
 
@@ -390,10 +401,10 @@ class Block:
     def _dump_tx(self, txid: TxID):
         pass
 
-    def __getitem__(self, tx_number) -> Transaction:
+    def __getitem__(self, tx_number: int) -> Transaction:
         return self._transactions[tx_number]
 
-    def __setitem__(self, tx_number, transaction):
+    def __setitem__(self, tx_number, transaction: Transaction):
         NotImplemented
 
     def __hash__(self) -> HeaderHash:
@@ -420,26 +431,25 @@ class BlockChain:
         if block.header.has_proof_of_work():
             if len(self._chain) == 0:
                 self._chain.append(block)
+                return None
             elif len(self._chain) > 0 and block.header.prev_block_hash == hash(self[-1]):
                 self._chain.append(block)
+                return None
 
         raise InvalidBlock(block)
 
     def __len__(self):
         return len(self._chain)
 
-    def __getitem__(self, height) -> Block:
-        return self._chain[height]
+    def __getitem__(self, key) -> Block:
+        return self._chain[key]
 
-    def __setitem__(self, height, block: Block):
+    def __setitem__(self, height: BlockHeight, block: Block):
         NotImplemented
 
     def __str__(self):
         return "\n".join(block.__str__() for block in self)
 
-
-BlockHeight = int
-OutputIndex = int
 
 class UTXOSet:
     '''
@@ -465,32 +475,33 @@ class UTXOSet:
         block height and value
     '''
     def __init__(self, blockchain: BlockChain):
-        self.height: BlockHeight = len(blockchain)
+        self.height: BlockHeight = len(blockchain) - 1
         self._data: dict[TxID, tuple[BlockHeight, dict[OutputIndex, TxOutput]]] = dict()
-        for tx in blockchain[0]:
-            self[hash(tx)] = (0, dict(zip(range(len(tx.outputs)), tx.outputs)))
+        if self.height > 0:
+            for tx in blockchain[0]:
+                self[hash(tx)] = (0, dict(zip(range(len(tx.outputs)), tx.outputs)))
 
-        for block in blockchain[1:]:
-            self.update(block)
+            for block in blockchain[1:]:
+                self.update(block)
 
-    def update(self, block: Block, new_height: Optional[BlockHeight] = None):
+    def update(self, block: Block):
         '''Update the UTXO set with the transactions in the block.'''
-        if new_height is None:
-            new_height = self.height + 1
+        # need to use a buffer to account for possible failure partway through block
 
         for tx in block:
-            for txi in tx.inputs:
-                try:
-                    del self._data[txi.prev_txid][1][txi.output_index]
-                    if len(self[txi.prev_txid][1]) == 0:
-                        del self._data[txi.prev_txid]
-                except KeyError:
-                    InvalidBlock(block)
+            if self.height > 0:
+                for txi in tx.inputs:
+                    try:
+                        del self._data[txi.prev_txid][1][txi.output_index]
+                        if len(self[txi.prev_txid][1]) == 0:
+                            del self._data[txi.prev_txid]
+                    except KeyError:
+                        InvalidBlock(block)
 
-            self[hash(tx)] = (new_height,
+            self[hash(tx)] = (self.height + 1,
                               {index: txo for index, txo in enumerate(tx.outputs)})
 
-        self.height = new_height
+        self.height += 1
 
     def __getitem__(self, txid: TxID) -> tuple[BlockHeight, dict[OutputIndex, TxOutput]]:
         return self._data[txid]
@@ -564,15 +575,14 @@ class FullNode:
                 cash -= txo.value
 
             return cash >= 0
- 
+
         # coinbase:
-        if sum(o.value for o in tx.outputs > 50) or len(tx.inputs) != 1:
+        if sum(o.value for o in tx.outputs) > 50 or len(tx.inputs) != 1:
             return False
 
-        return tx.inputs[0].prev_txid != 0 or tx.inputs[0].output_index != 0
+        return tx.inputs[0].prev_txid == 0 or tx.inputs[0].output_index == 0
 
-
-    def filter_block(self, height: int, bloom: BloomFilter) -> BloomResponseType:
+    def filter_block(self, height: BlockHeight, bloom: BloomFilter) -> BloomResponseType:
         '''Filter a block for matches agains a bloom filter'''
         response: BloomResponseType = dict()
         block = self.blockchain[height]
@@ -607,14 +617,15 @@ class Miner:
 
         return Transaction([tx_input], [tx_output], is_coinbase=True)
 
-    def _create_block(self, transactions: Sequence[Transaction]) -> Block:
+    def _create_block(self, transactions: list[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
-        cb_tx = self.create_coinbase_tx(self.address.public_key, 50)
+        cb_tx: Transaction = self.create_coinbase_tx(self.address.public_key, 50)
+        self.address.interesting_txids.add(hash(cb_tx))
         if len(self.address.headers) == 0:
             assert(len(transactions) == 0)      # no possible non-coinbase transactions in genesis block
             return Block([cb_tx], None)
 
-        return Block([cb_tx].append(transactions), hash(self.address.headers[-1]))
+        return Block([cb_tx] + transactions, hash(self.address.headers[-1]))
 
 
 class NetworkControl:
@@ -625,17 +636,9 @@ class NetworkControl:
 
         self.miners: set[Miner] = set()
         for _ in range(n_miners):
-            _ = self.add_miner()
+            self.add_miner()
 
-        self.full_nodes: set[FullNode] = set()
-        for _ in range(n_full_nodes):
-            self.add_full_node(genesis_miner.blockchain)
-
-        bloom = genesis_miner.address.generate_bloom_filter()
-        full_node = random.choice(list(self.full_nodes))
-        bloom_response = full_node.filter_block(0, bloom)
-        genesis_miner.address.process_proofs(bloom_response)
-
+        self.full_nodes: set[FullNode] = set((FullNode() for _ in range(n_full_nodes)))
         self.tx_queue: list[Transaction] = []
 
     def add_miner(self, headers: list[BlockHeader] = []):
@@ -643,10 +646,6 @@ class NetworkControl:
         miner = Miner(headers)
         self.addresses[hash(miner.address)] = miner.address
         self.miners.add(miner)
-
-    def add_full_node(self, blockchain: BlockChain):
-        '''Add a new full node to the list of full nodes.'''
-        self.full_nodes.add(FullNode(blockchain))
 
     def enqueue_tx(self, tx: Transaction):
         '''Add a new transaction to the queue of transactions.'''
@@ -671,8 +670,6 @@ class NetworkControl:
                     tx = address.create_transaction(tx_value, recipient.public_key)
                     self.enqueue_tx(tx)
 
-        print(self.tx_queue)
-
     def simulate_mining_round(self, block_size = 10) -> Block:
         '''Simulate multiple miners competing to finish a block.'''
         best_time = None
@@ -692,15 +689,29 @@ class NetworkControl:
         for fn in filter(lambda fn: fn.validate_block(block), self.full_nodes):
             fn.add_block(block)
 
+        for address in self.addresses.values():
+            address.add_header(block.header)
+            print(address.wealth)
+
+        # temporary solution
+        self.dequeue_txs(len(block._transactions))
+
     def simulate_query_round(self):
         '''Simulate the communication between full nodes and addresses to verify payments.'''
-        for address in self.addresses:
+        for address in self.addresses.values():
             bloom = address.generate_bloom_filter()
             full_node = random.choice(list(self.full_nodes))
-            bloom_response = full_node.filter_block(full_node.blockchain[-1], bloom)
+            bloom_response = full_node.filter_block(-1, bloom)
             address.process_proofs(bloom_response)
 
     def simulate_n_rounds(self, n_rounds):
+        block = self.simulate_mining_round()
+        for tx in block._transactions:
+            print(tx)
+
+        self.simulate_verification_round(block)
+        self.simulate_query_round()
+
         for _ in range(n_rounds):
             self.simulate_trading_round()
             block = self.simulate_mining_round()
@@ -709,4 +720,4 @@ class NetworkControl:
 
 
 nc = NetworkControl(20, 2, 1)
-nc.simulate_n_rounds(1)
+nc.simulate_n_rounds(10)
