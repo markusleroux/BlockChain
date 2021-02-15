@@ -296,13 +296,6 @@ class Address(SimplifiedPaymentVerification):
 
         return tx
 
-    def create_genesis_tx(self, receiver_pubkey: bytes, tx_type: str = "p2pk"):
-        '''Return a transaction sending 50 coin to receiver pubkey without using UTXO.'''
-        locking_script = LockingScript(receiver_pubkey, tx_type=tx_type)
-        tx = Transaction([], [TxOutput(50, locking_script)])
-        self._incoming_tx(tx)
-        return tx
-
     def process_proofs(self, proofs: BloomResponseType):
         for item in proofs.keys():
             if self.check_proofs(proofs, item):
@@ -326,7 +319,7 @@ class Address(SimplifiedPaymentVerification):
 
 
 class BlockHeader:
-    def __init__(self, merkle_root_hash, prev_block_hash=None):
+    def __init__(self, merkle_root_hash, prev_block_hash):
         self.merkle_root_hash = merkle_root_hash
         self.prev_block_hash: HeaderHash = prev_block_hash
         self.nonce: int = 0
@@ -349,10 +342,8 @@ class BlockHeader:
     def __hash__(self) -> HeaderHash:
         result = reduce(operator.add, (self.merkle_root_hash,
                                        self.nonce.to_bytes(4, 'big'),
-                                       self.timestamp.to_bytes(4, 'big')))
-
-        if self.prev_block_hash:
-            result += self.prev_block_hash.to_bytes(4, 'big')
+                                       self.timestamp.to_bytes(4, 'big'),
+                                       self.prev_block_hash.to_bytes(4, 'big')))
 
         return sha256_hash(result)
 
@@ -363,12 +354,30 @@ class BlockHeader:
                                                                                       self.prev_block_hash)
 
 
+class InvalidBlock(Exception):
+    def __init__(self, block: Block):
+        self.block = block
+        self.block_hash = hash(block)
+        self.message = "Invalid block"
+        super().__init__(self.message)
+
+    def __str__(self):
+        return f"{self.block_hash}: {self.message}"
+
+ 
 class Block:
-    def __init__(self, transactions: Sequence[Transaction], prev_block_hash=None):
-        # better to store as dictionary
+    def __init__(self, transactions: Sequence[Transaction], prev_block_hash = None):
         self._transactions: list[Transaction] = list(transactions)
         self.transactions_merkle: merklelib.MerkleTree = merklelib.MerkleTree(transactions)
-        self.header = BlockHeader(self.transactions_merkle.merkle_root.encode(), prev_block_hash)
+
+        if prev_block_hash is None and len(transactions) == 1 and transactions[0].is_coinbase:
+            # Genesis block contains one tx and dummy prev_block_hash
+            self.header = BlockHeader(self.transactions_merkle.merkle_root.encode(), 0)
+        elif prev_block_hash is not None and len(transactions) >= 1:
+            self.header = BlockHeader(self.transactions_merkle.merkle_root.encoide(), prev_block_hash)
+        else:
+            raise ValueError
+
         self.header.proof_of_work()
 
     def contains_txid(self, txid: TxID) -> bool:
@@ -411,7 +420,7 @@ class BlockChain:
         if block.header.has_proof_of_work():
             if len(self._chain) == 0:
                 self._chain.append(block)
-            elif len(self._chain) > 1 and block.header.prev_block_hash == hash(self[-1]):
+            elif len(self._chain) > 0 and block.header.prev_block_hash == hash(self[-1]):
                 self._chain.append(block)
 
         raise InvalidBlock(block)
@@ -429,16 +438,8 @@ class BlockChain:
         return "\n".join(block.__str__() for block in self)
 
 
-class InvalidBlock(Exception):
-    def __init__(self, block: Block):
-        self.block = block
-        self.block_hash = hash(block)
-        self.message = "Invalid block"
-        super().__init__(self.message)
-
-    def __str__(self):
-        return f"{self.block_hash}: {self.message}"
-
+BlockHeight = int
+OutputIndex = int
 
 class UTXOSet:
     '''
@@ -464,17 +465,17 @@ class UTXOSet:
         block height and value
     '''
     def __init__(self, blockchain: BlockChain):
-        self.height = len(blockchain)
-        self._data: dict[int, tuple[int, dict[int, TxOutput]]] = dict()
+        self.height: BlockHeight = len(blockchain)
+        self._data: dict[TxID, tuple[BlockHeight, dict[OutputIndex, TxOutput]]] = dict()
         for tx in blockchain[0]:
             self[hash(tx)] = (0, dict(zip(range(len(tx.outputs)), tx.outputs)))
 
         for block in blockchain[1:]:
             self.update(block)
 
-    def update(self, block: Block, new_height: int = -1):
+    def update(self, block: Block, new_height: Optional[BlockHeight] = None):
         '''Update the UTXO set with the transactions in the block.'''
-        if new_height < 0:
+        if new_height is None:
             new_height = self.height + 1
 
         for tx in block:
@@ -491,10 +492,10 @@ class UTXOSet:
 
         self.height = new_height
 
-    def __getitem__(self, txid: TxID) -> tuple[int, dict[int, TxOutput]]:
+    def __getitem__(self, txid: TxID) -> tuple[BlockHeight, dict[OutputIndex, TxOutput]]:
         return self._data[txid]
 
-    def __setitem__(self, txid: TxID, value: tuple[int, dict[int, TxOutput]]):
+    def __setitem__(self, txid: TxID, value: tuple[BlockHeight, dict[OutputIndex, TxOutput]]):
         self._data[txid] = value
 
 
@@ -511,15 +512,23 @@ class FullNode:
         '''Validate a new block.
 
         Conditions:
+            - there is at most one coinbase tx
             - validate_tx(tx) holds for all tx in block
-            - fits_blockchain_head(block) holds
+            - fits_blockchain_head(block) holds or this is the genesis block
             - no utxo is spent twice in block
         '''
-        if not block.header.prev_block_hash == hash(self.blockchain[-1]):
+        if not block.header.has_proof_of_work():
+            return False
+
+        if len(self.blockchain) > 0 and not block.header.prev_block_hash == hash(self.blockchain[-1]):
             return False
 
         spent_utxo = set()
+        coinbase_count = 0
         for tx in block:
+            if tx.is_coinbase:
+                coinbase_count += 1
+
             for txi in tx.inputs:
                 if (txi.prev_txid, txi.output_index) in spent_utxo:
                     return False
@@ -528,7 +537,7 @@ class FullNode:
             if not self.validate_tx(tx):
                 return False
 
-        return True
+        return coinbase_count <= 1
 
     def validate_tx(self, tx: Transaction) -> bool:
         '''Validate a new transaction.
@@ -538,22 +547,30 @@ class FullNode:
             - all txi contain correct unlocking script
             - total value of txo <= total value of txi
         '''
-        cash: float = 0
-        for txi in tx.inputs:
-            try:
-                prev_txo = self.UTXO_set[txi.prev_txid][1][txi.output_index]
-            except KeyError:
-                return False
+        if not tx.is_coinbase:
+            cash: float = 0
+            for txi in tx.inputs:
+                try:
+                    prev_txo = self.UTXO_set[txi.prev_txid][1][txi.output_index]
+                except KeyError:
+                    return False
 
-            if not prev_txo.locking_script.unlock(txi.unlocking_script):
-                return False
+                if not prev_txo.locking_script.unlock(txi.unlocking_script):
+                    return False
 
-            cash += prev_txo.value
+                cash += prev_txo.value
 
-        for txo in tx.outputs:
-            cash -= txo.value
+            for txo in tx.outputs:
+                cash -= txo.value
 
-        return cash >= 0
+            return cash >= 0
+ 
+        # coinbase:
+        if sum(o.value for o in tx.outputs > 50) or len(tx.inputs) != 1:
+            return False
+
+        return tx.inputs[0].prev_txid != 0 or tx.inputs[0].output_index != 0
+
 
     def filter_block(self, height: int, bloom: BloomFilter) -> BloomResponseType:
         '''Filter a block for matches agains a bloom filter'''
@@ -577,13 +594,13 @@ class Miner:
         self.address: Address = Address(headers=headers)
 
     def add_header(self, header: BlockHeader):
-        '''Add a block to the local copy of the blockchain.'''
+        '''Add a block heaader to the SPV part of the miner'''
         self.address.add_header(header)
 
     def create_coinbase_tx(self, receiver_pubkey, value, tx_type = "p2pk"):
         # we use our own private/public key for type checking, but anything is valid
         unlocking_script = UnlockingScript(self.address.private_key, self.address.public_key, tx_type="p2pk")
-        tx_input = TxInput(unlocking_script, UTXO(0, 0, value))
+        tx_input = TxInput(unlocking_script, UTXO(0, 0, 0))
 
         locking_script = LockingScript(receiver_pubkey, tx_type = tx_type)
         tx_output = TxOutput(value, locking_script)
@@ -592,7 +609,12 @@ class Miner:
 
     def _create_block(self, transactions: Sequence[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
-        return Block(transactions, hash(self.address.headers[-1]))
+        cb_tx = self.create_coinbase_tx(self.address.public_key, 50)
+        if len(self.address.headers) == 0:
+            assert(len(transactions) == 0)      # no possible non-coinbase transactions in genesis block
+            return Block([cb_tx], None)
+
+        return Block([cb_tx].append(transactions), hash(self.address.headers[-1]))
 
 
 class NetworkControl:
