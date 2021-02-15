@@ -96,6 +96,25 @@ class Transaction:
     outputs: list[TxOutput]
     is_coinbase: bool = False
 
+    def is_vaild_coinbase(self):
+        '''Return True if and only if this is a valid coinbase transaction.
+
+        Conditions:
+        ----------
+            - there is exactly one input transaction
+            - the previous txid in that input is 0
+            - the output index in that input is 0
+            - the value of the output is less than 50
+            - the transaction is marked coinbase
+
+
+        '''
+        return len(self.inputs) == 1 and \
+            self.inputs[0].prev_txid == 0 and \
+            self.inputs[0].outputs_index == 0 and \
+            sum(o.value for o in self.outputs) < 50 and \
+            self.is_coinbase
+
     def __hash__(self) -> TxID:
         # This is a really bad way to do this
         result = reduce(operator.add, (hash(i).to_bytes(10, 'big') for i in self.inputs), b'0')
@@ -103,13 +122,15 @@ class Transaction:
         return sha256_hash(result)
 
     def __str__(self):
-        return "INPUTS:\n" + "\n".join(str(i) for i in self.inputs) + "\nOUTPUTS:\n" + "\n".join(str(o) for o in self.outputs)
+        return "INPUTS:\n" + "\n".join(str(i) for i in self.inputs) + \
+            "\nOUTPUTS:\n" + "\n".join(str(o) for o in self.outputs)
 
 
 class BloomFilter:
     '''Bloom filters allow for efficient descriptions of subsets of transactions.
+       https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki#filter-matching-algorithm
 
-    https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki#filter-matching-algorithm
+
     '''
     def __init__(self, N: int, P: float):
         self.N = N
@@ -141,6 +162,8 @@ class BloomFilter:
             The number of elements which will be added
         P : float
             The desired false positive threshold
+
+
         '''
         return int(((-1 / (math.log(2)**2)) * N * math.log(P)) / 8)
 
@@ -153,6 +176,8 @@ class BloomFilter:
         N : int
             The number of elements which will be added
         S : the size of the filter
+
+
         '''
         return int(S * N * math.log(2) / 8)
 
@@ -162,12 +187,9 @@ BloomResponseType = dict[Union[TxID, bytes], tuple[BlockHeight, Transaction, mer
 
 class SimplifiedPaymentVerification:
     def __init__(self, headers: list[BlockHeader] = [], txids: set[TxID] = set(), pubkeys: set[bytes] = set()):
-        self.headers = headers
+        self.headers: list[BlockHeader] = headers
         self.interesting_txids: set[TxID] = txids
         self.interesting_pubkeys: set[bytes] = pubkeys
-
-    def add_header(self, header: BlockHeader):
-        self.headers.append(header)
 
     def generate_bloom_filter(self, fp: float = 0.1, extra_size: int = 0) -> BloomFilter:
         '''Return a bloom filter describing the iteresting txid and pubkeys.
@@ -183,6 +205,8 @@ class SimplifiedPaymentVerification:
         ------
         bloom : BloomFilter
             A bloom filter describing the interesting txid and pubkeys
+
+
         '''
         bloom = BloomFilter(len(self.interesting_txids) + len(self.interesting_pubkeys) + extra_size, fp)
         for txid in self.interesting_txids:
@@ -232,7 +256,7 @@ class UTXO:
 class Address(SimplifiedPaymentVerification):
     def __init__(self, headers: list[BlockHeader] = []):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
-        self._my_utxo: dict[int, UTXO] = dict()  # txid : UTXO(txid, output_index, value)
+        self._my_utxo: dict[TxID, UTXO] = dict()
         super().__init__(headers = headers, pubkeys = {self.public_key})
 
     @property
@@ -242,7 +266,8 @@ class Address(SimplifiedPaymentVerification):
     def has_pending(self) -> bool:
         return any(utxo._pending for utxo in self._my_utxo.values())
 
-    def get_pending(self) -> set[UTXO]:
+    @property
+    def pending_txs(self) -> set[UTXO]:
         return {utxo for utxo in self._my_utxo.values() if utxo._pending}
 
     @property
@@ -308,6 +333,11 @@ class Address(SimplifiedPaymentVerification):
         return tx
 
     def process_proofs(self, proofs: BloomResponseType):
+        '''Update pending transactions and add new utxo in accordance with proofs
+        sent from a full node.
+
+
+        '''
         for item in proofs.keys():
             if self.check_proofs(proofs, item):
                 if isinstance(item, TxID):
@@ -359,10 +389,11 @@ class BlockHeader:
         return sha256_hash(result)
 
     def __str__(self):
-        return "Merkle_Root: {},\nNonce: {},\nTimestamp: {},\nPrevious Block Hash: {}".format(self.merkle_root_hash,
-                                                                                      self.nonce,
-                                                                                      self.timestamp,
-                                                                                      self.prev_block_hash)
+        # The style here is a little rough, but how to break up string...
+        return "Merkle_Root: {},\n".format(self.merkle_root_hash) + \
+        "Nonce: {},\n".format(self.nonce) + \
+        "Timestamp: {},\n".format(self.timestamp) + \
+        "Previous Block Hash: {}".format(self.prev_block_hash)
 
 
 class InvalidBlock(Exception):
@@ -394,6 +425,25 @@ class Block:
     def contains_txid(self, txid: TxID) -> bool:
         '''Verify tx specified by txid is contained in block.'''
         return self.transactions_merkle.verify_leaf_inclusion(txid, self.transactions_merkle.get_proof(txid))
+
+    def no_internal_double_spend(self):
+        '''Return True if/only if no utxo is spent twice in the block.'''
+        spent_utxo = set()
+        for tx in self:
+            for txi in tx.inputs:
+                if (txi.prev_txid, txi.output_index) in spent_utxo:
+                    return False
+                spent_utxo.add((txi.prev_txid, txi.output_index))
+        return True
+
+    def one_valid_coinbase(self):
+        '''Return True if/only if the block contains at most one coinbase and it is valid.'''
+        count = 0
+        for coinbase in filter(lambda tx: tx.is_coinbase, self):
+            if not coinbase.is_vaild_coinbase:
+                return False
+            count += 1
+        return count <= 1
 
     def __iter__(self):
         yield from self._transactions
@@ -427,6 +477,8 @@ class BlockChain:
         ----------
             - has proof of work
             - previous block header field matches blockchain head or genesis block
+
+
         '''
         if block.header.has_proof_of_work():
             if len(self._chain) == 0:
@@ -473,6 +525,8 @@ class UTXOSet:
 
     value
         block height and value
+
+
     '''
     def __init__(self, blockchain: BlockChain):
         self.height: BlockHeight = len(blockchain) - 1
@@ -486,25 +540,70 @@ class UTXOSet:
 
     def update(self, block: Block):
         '''Update the UTXO set with the transactions in the block.'''
-        # need to use a buffer to account for possible failure partway through block
+        if not self.only_spendable_input(block):
+            raise InvalidBlock(block)
 
         for tx in block:
             if self.height > 0:
                 for txi in tx.inputs:
-                    try:
-                        del self._data[txi.prev_txid][1][txi.output_index]
-                        if len(self[txi.prev_txid][1]) == 0:
-                            del self._data[txi.prev_txid]
-                    except KeyError:
-                        InvalidBlock(block)
+                    del self._data[txi.prev_txid][1][txi.output_index]
+                    if len(self[txi.prev_txid][1]) == 0:
+                        del self._data[txi.prev_txid]
 
             self[hash(tx)] = (self.height + 1,
                               {index: txo for index, txo in enumerate(tx.outputs)})
 
         self.height += 1
 
-    def __getitem__(self, txid: TxID) -> tuple[BlockHeight, dict[OutputIndex, TxOutput]]:
-        return self._data[txid]
+    def only_spendable_input(self, block: Block):
+        '''Determine if all TxInput uses spendable TxOutput
+
+        Conditions
+        ----------
+            - txo referenced by txi is in utxo_set
+            - txi unlocking script unlocks locking script of referenced txi
+
+
+        '''
+        for tx in block:
+            for txi in tx.inputs:
+                try:
+                    tx_output_dict = self[txi.prev_txid][1]
+                    prev_txo = tx_output_dict[txi.output_index]
+                    if not prev_txo.locking_script.unlock(txi.unlocking_script):
+                        return False
+                except KeyError:
+                    return False
+        return True
+
+    def no_overspend(self, block: Block):
+        '''Return True if and only if no tx spends more output than the utxo it claims.
+
+        This exludes the coinbase tx, which may spend up to a fixed amount
+        without reference to utxo. See Transaction.is_valid_coinbase()
+
+
+        '''
+        # Note: only for use after UTXO_set.only_spendable_input
+        for tx in block:
+            if not tx.is_coinbase:
+                cash: float = 0
+                for txi in tx.inputs:
+                    tx_output_dict = self[txi.prev_txid][1]
+                    utxo = tx_output_dict[txi.output_index]
+                    cash += utxo.value
+
+                if cash < sum(txo.value for txo in tx.outputs):
+                    return False
+
+            else:
+                if sum(txo.value for txo in tx.outputs) > 50:
+                    return False
+
+        return True
+
+    def __getitem__(self, item):
+        return self._data[item]
 
     def __setitem__(self, txid: TxID, value: tuple[BlockHeight, dict[OutputIndex, TxOutput]]):
         self._data[txid] = value
@@ -512,8 +611,8 @@ class UTXOSet:
 
 class FullNode:
     def __init__(self, blockchain: BlockChain = BlockChain()):
-        self.blockchain = blockchain
-        self.UTXO_set = UTXOSet(blockchain)
+        self.blockchain: BlockChain = blockchain
+        self.UTXO_set: UTXOSet = UTXOSet(blockchain)
 
     def add_block(self, block):
         self.UTXO_set.update(block)
@@ -523,10 +622,14 @@ class FullNode:
         '''Validate a new block.
 
         Conditions:
-            - there is at most one coinbase tx
-            - validate_tx(tx) holds for all tx in block
-            - fits_blockchain_head(block) holds or this is the genesis block
-            - no utxo is spent twice in block
+            - the block has proof of work
+            - the block is either the genesis block or it has the previous blocks header
+            - the block does not contain the same utxo spent twice
+            - there is at most one coinbase tx and it is valid
+            - the block does not spend more than the utxo it claims
+            - the block only spends output in the UTXO set for which it has the public key
+
+
         '''
         if not block.header.has_proof_of_work():
             return False
@@ -534,53 +637,13 @@ class FullNode:
         if len(self.blockchain) > 0 and not block.header.prev_block_hash == hash(self.blockchain[-1]):
             return False
 
-        spent_utxo = set()
-        coinbase_count = 0
-        for tx in block:
-            if tx.is_coinbase:
-                coinbase_count += 1
-
-            for txi in tx.inputs:
-                if (txi.prev_txid, txi.output_index) in spent_utxo:
-                    return False
-                spent_utxo.add((txi.prev_txid, txi.output_index))
-
-            if not self.validate_tx(tx):
-                return False
-
-        return coinbase_count <= 1
-
-    def validate_tx(self, tx: Transaction) -> bool:
-        '''Validate a new transaction.
-
-        Conditions:
-            - all txi use txo in UTXOset
-            - all txi contain correct unlocking script
-            - total value of txo <= total value of txi
-        '''
-        if not tx.is_coinbase:
-            cash: float = 0
-            for txi in tx.inputs:
-                try:
-                    prev_txo = self.UTXO_set[txi.prev_txid][1][txi.output_index]
-                except KeyError:
-                    return False
-
-                if not prev_txo.locking_script.unlock(txi.unlocking_script):
-                    return False
-
-                cash += prev_txo.value
-
-            for txo in tx.outputs:
-                cash -= txo.value
-
-            return cash >= 0
-
-        # coinbase:
-        if sum(o.value for o in tx.outputs) > 50 or len(tx.inputs) != 1:
+        if not block.no_internal_double_spend() or not block.one_valid_coinbase():
             return False
 
-        return tx.inputs[0].prev_txid == 0 or tx.inputs[0].output_index == 0
+        if not self.UTXO_set.no_overspend(block) or self.UTXO_set.only_spendable_input(block):
+            return False
+
+        return True
 
     def filter_block(self, height: BlockHeight, bloom: BloomFilter) -> BloomResponseType:
         '''Filter a block for matches agains a bloom filter'''
@@ -603,10 +666,6 @@ class Miner:
     def __init__(self, headers):
         self.address: Address = Address(headers=headers)
 
-    def add_header(self, header: BlockHeader):
-        '''Add a block heaader to the SPV part of the miner'''
-        self.address.add_header(header)
-
     def create_coinbase_tx(self, receiver_pubkey, value, tx_type = "p2pk"):
         # we use our own private/public key for type checking, but anything is valid
         unlocking_script = UnlockingScript(self.address.private_key, self.address.public_key, tx_type="p2pk")
@@ -617,7 +676,7 @@ class Miner:
 
         return Transaction([tx_input], [tx_output], is_coinbase=True)
 
-    def _create_block(self, transactions: list[Transaction]) -> Block:
+    def create_block(self, transactions: list[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
         cb_tx: Transaction = self.create_coinbase_tx(self.address.public_key, 50)
         self.address.interesting_txids.add(hash(cb_tx))
@@ -675,7 +734,7 @@ class NetworkControl:
         best_time = None
         for miner in self.miners:
             start = time.time()
-            block = miner._create_block(self.tx_queue[:block_size])
+            block = miner.create_block(self.tx_queue[:block_size])
             end = time.time()
             elapsed = end - start
             if not best_time or elapsed < best_time:
@@ -690,7 +749,7 @@ class NetworkControl:
             fn.add_block(block)
 
         for address in self.addresses.values():
-            address.add_header(block.header)
+            address.headers.append(block.header)
             print(address.wealth)
 
         # temporary solution
