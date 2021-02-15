@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations                  # type annotations in the future
-from typing import Sequence, Iterable, Optional     # type hints
-from functools import reduce                        # fold
-from dataclasses import dataclass, field, InitVar   # class magic
-import operator                                     # non-infix addition 
-import time                                         # timestamp
-import random                                       # randomness in network control
-import math                                         # log and power
-import hashlib                                      # hash function
-import bitarray                                     # bloom filter
-import mmh3                                         # murmer hashes
-import merklelib                                    # merkle tree
-import ecdsa                                        # eliptic curve keys
- 
+from __future__ import annotations                          # type annotations in the future
+from typing import Sequence, Optional, Union                # type hints
+from functools import reduce                                # fold
+from dataclasses import dataclass, field, InitVar           # class magic
+import operator                                             # non-infix addition
+import time                                                 # timestamp
+import random                                               # randomness in network control
+import math                                                 # log and power
+import hashlib                                              # hash function
+import bitarray                                             # bloom filter
+import mmh3                                                 # murmer hashes
+import merklelib                                            # merkle tree
+import ecdsa                                                # eliptic curve keys
+
 
 TxID = int
 HeaderHash = int
@@ -95,8 +95,8 @@ class Transaction:
 
     def __hash__(self) -> TxID:
         # This is a really bad way to do this
-        result = reduce(operator.add, (hash(i).to_bytes(10, 'big') for i in self.inputs))
-        result += reduce(operator.add, (hash(o).to_bytes(10, 'big') for o in self.outputs))
+        result = reduce(operator.add, (hash(i).to_bytes(10, 'big') for i in self.inputs), b'0')
+        result += reduce(operator.add, (hash(o).to_bytes(10, 'big') for o in self.outputs), b'0')
         return sha256_hash(result)
 
 
@@ -112,16 +112,15 @@ class BloomFilter:
         self.n_hashes = self.get_n_hashes(N, self.size)
         self.bitarray = bitarray.bitarray(self.size)
 
-    def add(self, tx: TxID):
-        '''Add an item (usually, tx) to the filter.'''
+    def add(self, item: Union[TxID, bytes]):
+        '''Add an item (tx or pubkey) to the filter.'''
         for i in range(self.n_hashes):
             # Index error?
-            self.bitarray[mmh3.hash(tx, i)] = True
+            self.bitarray[mmh3.hash(item, i)] = True
 
-    def check(self, tx: TxID) -> bool:
+    def check(self, item: Union[TxID, bytes]) -> bool:
         '''Check if an item is in the filter.'''
-        return all(
-            self.bitarray(mmh3.hash(tx, i)) for i in range(self.n_hashes))
+        return all(self.bitarray(mmh3.hash(item, i)) for i in range(self.n_hashes))
 
     @staticmethod
     def get_size(N: int, P: float) -> int:
@@ -149,18 +148,20 @@ class BloomFilter:
         return int(S * N * math.log(2) / 8)
 
 
-class SimplifiedPaymentVerification:
-    def __init__(self, headers: list[BlockHeader]):
-        self.headers = headers
+BloomResponseType = dict[Union[TxID, bytes], tuple[int, Transaction, merklelib.AuditProof]]
 
-    @staticmethod
-    def generate_bloom_filter(txids: set[TxID], fp: float = 0.1, extra_size: int = 0) -> BloomFilter:
-        '''Return a bloom filter describing the txids.
+
+class SimplifiedPaymentVerification:
+    def __init__(self, headers: list[BlockHeader] = [], txids: set[TxID] = set(), pubkeys: set[bytes] = set()):
+        self.headers = headers
+        self.interesting_txids: set[TxID] = txids
+        self.interesting_pubkeys: set[bytes] = pubkeys
+
+    def generate_bloom_filter(self, fp: float = 0.1, extra_size: int = 0) -> BloomFilter:
+        '''Return a bloom filter describing the iteresting txid and pubkeys.
 
         Arguments
         --------
-        txids : list[TxID]
-            A list of transaction ids to look up
         fp : float in (0, 1)
             The maximum false positive rate when queering the filter
         extra_size : int
@@ -169,35 +170,55 @@ class SimplifiedPaymentVerification:
         Return
         ------
         bloom : BloomFilter
-            A bloom filter describing the txid
+            A bloom filter describing the interesting txid and pubkeys
         '''
-        bloom = BloomFilter(len(txids) + extra_size, fp)
-        for txid in txids:
+        bloom = BloomFilter(len(self.interesting_txids) + len(self.interesting_pubkeys) + extra_size, fp)
+        for txid in self.interesting_txids:
             bloom.add(txid)
+
+        for pubkey in self.interesting_pubkeys:
+            bloom.add(pubkey)
+
         return bloom
 
-    def verify_tx(self, proofs: dict[TxID, tuple[int, merklelib.AuditProof]], txid: TxID):
-        '''Use the provided proofs to verify the inclusion of txid in the chain.'''
-        try:
-            audit_proof = proofs[txid][1]
-            prev_block_hash = self.headers[proofs[txid][0]].prev_block_hash
-            return merklelib.verify_leaf_inclusion(txid, audit_proof, merklelib.Hasher(), prev_block_hash)
-        except KeyError:
-            print("Transaction not in collection of proofs.")
+    def check_proofs(self, proofs: BloomResponseType, item: Union[TxID, bytes]) -> bool:
+        '''Use the provided proofs to verify the inclusion of txid or pubkey in the chain.'''
+        if isinstance(item, TxID):
+            try:
+                height, _, proof = proofs[item]
+                prev_block_hash = self.headers[height].prev_block_hash
+                return merklelib.verify_leaf_inclusion(item, proof, merklelib.Hasher(), prev_block_hash)
+            except KeyError:
+                print("Transaction not in collection of proofs.")
+                return False
 
+        elif isinstance(item, bytes):
+            try:
+                height, tx, proof = proofs[item]
+                prev_block_hash = self.headers[height].prev_block_hash
+                if not merklelib.verify_leaf_inclusion(hash(tx), proof, merklelib.Hasher(), prev_block_hash):
+                    return False
+
+                # AT LEAST one matching pubkey in tx
+                return any(o.locking_script.pubkey == item for o in tx.outputs)
+
+            except KeyError:
+                print("Pubkey not in colection of proofs.")
+                return False
 
 @dataclass
 class UTXO:
     txid: TxID
     output_index: int
     value: float = field(hash=False)
-    _pending: Optional[TxID] = field(default=None, init=False)
+    _pending: Optional[TxID] = field(default=None, init=False)         # store the txid of the spending tx 
 
 
 class Address(SimplifiedPaymentVerification):
     def __init__(self):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
         self._my_utxo: dict[int, UTXO] = dict()  # txid : UTXO(txid, output_index, value)
+        super().__init__(pubkeys = {self.public_key})
 
     @property
     def wealth(self) -> float:
@@ -216,9 +237,10 @@ class Address(SimplifiedPaymentVerification):
     def _sign(self, byte_string: bytes):
         return self.private_key.sign(byte_string)
 
-    def _incoming_tx(self, txid: TxID, output_index: int, value: float):
-        '''Add a transaction to myUTXO set'''
-        self[txid] = UTXO(txid, output_index, value)
+    def _incoming_tx(self, tx: Transaction):
+        '''Add all utxo in tx attributes to self.pubkey to _my_utxo'''
+        for i, o in ((i, o) for i, o in enumerate(tx.outputs) if o.locking_script.pubkey == self.public_key):
+            self[hash(tx)] = UTXO(hash(tx), i, o.value)
 
     def _reset_pending_transaction(self, txid: TxID):
         '''Reset UTXO when transaction has failed.'''
@@ -227,6 +249,7 @@ class Address(SimplifiedPaymentVerification):
     def _clear_pending_tx(self, txid: TxID):
         '''Remove UTXO when transaction has cleared.'''
         del self._my_utxo[txid]
+        self.interesting_txids.remove(txid)
 
     def _gather_utxos(self, value: float) -> tuple[set[UTXO], float]:
         '''Get a set of UTXO with combined value greater than value.'''
@@ -263,6 +286,7 @@ class Address(SimplifiedPaymentVerification):
         outputs.append(TxOutput(extra_value, locking_script_for_change))
 
         tx = Transaction(inputs, outputs)
+        self.interesting_txids.add(hash(tx))
         for utxo in gathered_utxo:
             utxo._pending = hash(tx)
 
@@ -271,15 +295,21 @@ class Address(SimplifiedPaymentVerification):
     def create_genesis_tx(self, receiver_pubkey: bytes, tx_type: str = "p2pk"):
         '''Return a transaction sending 50 coin to receiver pubkey without using UTXO.'''
         locking_script = LockingScript(receiver_pubkey, tx_type=tx_type)
-        return Transaction([], [TxOutput(50, locking_script)])
+        tx = Transaction([], [TxOutput(50, locking_script)])
+        self._incoming_tx(tx)
+        return tx
 
-    def process_proofs_outgoing(self, proofs: dict[TxID, tuple[int, merklelib.AuditProof]]): 
-        for utxo in self.get_pending():
-            assert utxo._pending is not None        # necessary for mypy
-            
-            # Need error handling
-            if self.verify_tx(proofs, utxo._pending):
-                pass
+    def process_proofs(self, proofs: BloomResponseType):
+        for item in proofs.keys():
+            if self.check_proofs(proofs, item):
+                if isinstance(item, TxID):
+                    try:
+                        self._clear_pending_tx(item)
+                    except KeyError:
+                        # txid was interesting but not in my_utxo set
+                        pass
+                elif isinstance(item, bytes):
+                    self._incoming_tx(proofs[item][1])
 
     def __getitem__(self, key):
         return self._my_utxo[key]
@@ -313,10 +343,12 @@ class BlockHeader:
         return True
 
     def __hash__(self) -> HeaderHash:
-        result = reduce(operator.add, (bytes.fromhex(self.merkle_root_hash),
+        result = reduce(operator.add, (self.merkle_root_hash,
                                        self.nonce.to_bytes(4, 'big'),
-                                       self.timestamp.to_bytes(4, 'big'),
-                                       self.prev_block_hash.to_bytes(4, 'big')))
+                                       self.timestamp.to_bytes(4, 'big')))
+
+        if self.prev_block_hash:
+            result += self.prev_block_hash.to_bytes(4, 'big')
 
         return sha256_hash(result)
 
@@ -516,19 +548,21 @@ class FullNode:
 
         return cash >= 0
 
-    @staticmethod
-    def filter_block(block: Block, bloom: BloomFilter) -> list[TxID]:
-        '''Return a list of txid which match with the filter.'''
-        matches = list()
+    def filter_block(self, height: int, bloom: BloomFilter) -> BloomResponseType:
+        '''Filter a block for matches agains a bloom filter'''
+        response: BloomResponseType = dict()
+        block = self.blockchain[height]
         for tx in block:
-            bloom.check(tx)
-            matches.append(hash(tx))
+            proof = block.transactions_merkle.get_proof(hash(tx))
+            if bloom.check(hash(tx)):
+                response[hash(tx)] = (height, tx, proof)
 
-        return matches
+            for output in tx.outputs:
+                pubkey = output.locking_script.pubkey
+                if bloom.check(pubkey):
+                    response[pubkey] = (height, tx, proof)
 
-    def generate_proofs(self, height: int, txids: Sequence[TxID]) -> dict[TxID, merklelib.AuditProof]:
-        '''Return a dictionary assocating txid with block height and a proof the txid is in the block.'''
-        return {txid: (height, self.blockchain[height].transactions_merkle.get_proof(txid)) for txid in txids}
+        return response
 
 
 class Miner:
@@ -551,7 +585,7 @@ class Miner:
 
 
 class NetworkControl:
-    def __init__(self, n_miners: int, n_addresses: int, n_full_nodes: int):
+    def __init__(self, n_addresses: int, n_miners: int, n_full_nodes: int):
         self.addresses: dict[int, Address] = {
             hash(ad): ad
             for ad in (Address() for _ in range(n_addresses))
@@ -587,7 +621,8 @@ class NetworkControl:
         '''Remove the first n transactions from the list of transactions.'''
         self.tx_queue = self.tx_queue[n:]
 
-    def simulate_trading_round(self, P: float):
+    def simulate_trading_round(self, P: float = 1):
+        '''Simulate a series of transactions between addresses.'''
         for address in self.addresses.values():
             if address.wealth > 0 and random.random() > P:
                 # proportion of wealth to spend
@@ -601,7 +636,10 @@ class NetworkControl:
                     tx = address.create_transaction(tx_value, recipient.public_key)
                     self.enqueue_tx(tx)
 
+        print(self.tx_queue)
+
     def simulate_mining_round(self, block_size = 10) -> Block:
+        '''Simulate multiple miners competing to finish a block.'''
         best_time = None
         for miner in self.miners:
             start = time.time()
@@ -609,19 +647,32 @@ class NetworkControl:
             end = time.time()
             elapsed = end - start
             if not best_time or elapsed < best_time:
-                fastest_miner, fastest_block, best_time = miner, block, elapsed
+                fastest_block, best_time = block, elapsed
 
         return fastest_block
 
     def simulate_verification_round(self, block: Block):
-        for fn in filter(lambda fn : fn.validate_block(block), self.full_nodes):
+        '''Simulate block validation by full nodes.'''
+        # Full nodes which are able to verify add the block
+        for fn in filter(lambda fn: fn.validate_block(block), self.full_nodes):
             fn.add_block(block)
 
     def simulate_query_round(self):
-        for address in filter(lambda add : add.has_pending(), self.addresses.values()):
-            bloom = address.generate_bloom_filter(address.get_pending())
+        '''Simulate the communication between full nodes and addresses to verify payments.'''
+        for address in self.addresses:
+            bloom = address.generate_bloom_filter()
             full_node = random.choice(list(self.full_nodes))
-            found_tx = full_node.filter_block(full_node.blockchain[-1], bloom)
-            proofs = full_node.generate_proofs(len(full_node.blockchain), found_tx)
-            address.process_proofs_outgoing(proofs)
-           # process incoming tx
+            bloom_response = full_node.filter_block(full_node.blockchain[-1], bloom)
+            proofs = full_node.generate_proofs(len(full_node.blockchain), bloom_response)
+            address.process_proofs(proofs)
+
+    def simulate_n_rounds(self, n_rounds):
+        for _ in range(n_rounds):
+            self.simulate_trading_round()
+            block = self.simulate_mining_round()
+            self.simulate_verification_round(block)
+            self.simulate_query_round()
+
+
+nc = NetworkControl(20, 2, 1)
+nc.simulate_n_rounds(1)
