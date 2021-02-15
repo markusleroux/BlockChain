@@ -92,6 +92,7 @@ class TxInput:
 class Transaction:
     inputs: list[TxInput]
     outputs: list[TxOutput]
+    is_coinbase: bool = False
 
     def __hash__(self) -> TxID:
         # This is a really bad way to do this
@@ -396,8 +397,8 @@ class Block:
 
 
 class BlockChain:
-    def __init__(self, genesis_block: Block):
-        self._chain: list[Block] = [genesis_block]
+    def __init__(self):
+        self._chain: list[Block] = []
 
     def add_block(self, block: Block):
         '''Add a block to the blockchain.
@@ -405,10 +406,13 @@ class BlockChain:
         Conditions
         ----------
             - has proof of work
-            - previous block header field matches blockchain head
+            - previous block header field matches blockchain head or genesis block
         '''
-        if (block.header.has_proof_of_work() and block.header.prev_block_hash == hash(self[-1])):
-            self._chain.append(block)
+        if block.header.has_proof_of_work():
+            if len(self._chain) == 0:
+                self._chain.append(block)
+            elif len(self._chain) > 1 and block.header.prev_block_hash == hash(self[-1]):
+                self._chain.append(block)
 
         raise InvalidBlock(block)
 
@@ -495,7 +499,7 @@ class UTXOSet:
 
 
 class FullNode:
-    def __init__(self, blockchain: BlockChain):
+    def __init__(self, blockchain: BlockChain = BlockChain()):
         self.blockchain = blockchain
         self.UTXO_set = UTXOSet(blockchain)
 
@@ -569,26 +573,26 @@ class FullNode:
 
 
 class Miner:
-    def __init__(self, blockchain: BlockChain = None):
-        self.address = Address()
-        if not blockchain:
-            # Create genesis_block
-            genesis_tx = self.address.create_genesis_tx(self.address.public_key)
-            self.blockchain = BlockChain(Block([genesis_tx]))
-        else:
-            self.blockchain = blockchain
+    def __init__(self, headers):
+        self.address: Address = Address(headers=headers)
 
-        for block in self.blockchain:
-            self.address.add_header(block.header)
-
-    def add_block(self, block: Block):
+    def add_header(self, header: BlockHeader):
         '''Add a block to the local copy of the blockchain.'''
-        self.blockchain.add_block(block)
-        self.address.add_header(block.header)
+        self.address.add_header(header)
+
+    def create_coinbase_tx(self, receiver_pubkey, value, tx_type = "p2pk"):
+        # we use our own private/public key for type checking, but anything is valid
+        unlocking_script = UnlockingScript(self.address.private_key, self.address.public_key, tx_type="p2pk")
+        tx_input = TxInput(unlocking_script, UTXO(0, 0, value))
+
+        locking_script = LockingScript(receiver_pubkey, tx_type = tx_type)
+        tx_output = TxOutput(value, locking_script)
+
+        return Transaction([tx_input], [tx_output], is_coinbase=True)
 
     def _create_block(self, transactions: Sequence[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
-        return Block(transactions, hash(self.blockchain[-1]))
+        return Block(transactions, hash(self.address.headers[-1]))
 
 
 class NetworkControl:
@@ -598,9 +602,8 @@ class NetworkControl:
         }
 
         self.miners: set[Miner] = set()
-        genesis_miner = self.add_miner()
         for _ in range(n_miners):
-            _ = self.add_miner(genesis_miner.blockchain)
+            _ = self.add_miner()
 
         self.full_nodes: set[FullNode] = set()
         for _ in range(n_full_nodes):
@@ -613,12 +616,11 @@ class NetworkControl:
 
         self.tx_queue: list[Transaction] = []
 
-    def add_miner(self, blockchain: BlockChain = None) -> Miner:
+    def add_miner(self, headers: list[BlockHeader] = []):
         '''Add a new miner to the set of miners and add their address to the list of addresses.'''
-        miner = Miner(blockchain)
+        miner = Miner(headers)
         self.addresses[hash(miner.address)] = miner.address
         self.miners.add(miner)
-        return miner
 
     def add_full_node(self, blockchain: BlockChain):
         '''Add a new full node to the list of full nodes.'''
