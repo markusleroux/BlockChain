@@ -157,6 +157,9 @@ class SimplifiedPaymentVerification:
         self.interesting_txids: set[TxID] = txids
         self.interesting_pubkeys: set[bytes] = pubkeys
 
+    def add_header(self, header: BlockHeader):
+        self.headers.append(header)
+
     def generate_bloom_filter(self, fp: float = 0.1, extra_size: int = 0) -> BloomFilter:
         '''Return a bloom filter describing the iteresting txid and pubkeys.
 
@@ -215,10 +218,10 @@ class UTXO:
 
 
 class Address(SimplifiedPaymentVerification):
-    def __init__(self):
+    def __init__(self, headers: list[BlockHeader] = []):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
         self._my_utxo: dict[int, UTXO] = dict()  # txid : UTXO(txid, output_index, value)
-        super().__init__(pubkeys = {self.public_key})
+        super().__init__(headers = headers, pubkeys = {self.public_key})
 
     @property
     def wealth(self) -> float:
@@ -255,7 +258,7 @@ class Address(SimplifiedPaymentVerification):
         '''Get a set of UTXO with combined value greater than value.'''
         remaining_value = value
         gathered_utxo = set()
-        for utxo in filter(lambda utxo : not utxo._pending, self._my_utxo.values()):
+        for utxo in filter(lambda utxo: not utxo._pending, self._my_utxo.values()):
             if remaining_value <= 0:
                 break
 
@@ -575,9 +578,13 @@ class Miner:
         else:
             self.blockchain = blockchain
 
+        for block in self.blockchain:
+            self.address.add_header(block.header)
+
     def add_block(self, block: Block):
         '''Add a block to the local copy of the blockchain.'''
         self.blockchain.add_block(block)
+        self.address.add_header(block.header)
 
     def _create_block(self, transactions: Sequence[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
@@ -587,8 +594,7 @@ class Miner:
 class NetworkControl:
     def __init__(self, n_addresses: int, n_miners: int, n_full_nodes: int):
         self.addresses: dict[int, Address] = {
-            hash(ad): ad
-            for ad in (Address() for _ in range(n_addresses))
+            hash(ad): ad for ad in (Address() for _ in range(n_addresses - n_miners))
         }
 
         self.miners: set[Miner] = set()
@@ -599,6 +605,11 @@ class NetworkControl:
         self.full_nodes: set[FullNode] = set()
         for _ in range(n_full_nodes):
             self.add_full_node(genesis_miner.blockchain)
+
+        bloom = genesis_miner.address.generate_bloom_filter()
+        full_node = random.choice(list(self.full_nodes))
+        bloom_response = full_node.filter_block(0, bloom)
+        genesis_miner.address.process_proofs(bloom_response)
 
         self.tx_queue: list[Transaction] = []
 
@@ -663,8 +674,7 @@ class NetworkControl:
             bloom = address.generate_bloom_filter()
             full_node = random.choice(list(self.full_nodes))
             bloom_response = full_node.filter_block(full_node.blockchain[-1], bloom)
-            proofs = full_node.generate_proofs(len(full_node.blockchain), bloom_response)
-            address.process_proofs(proofs)
+            address.process_proofs(bloom_response)
 
     def simulate_n_rounds(self, n_rounds):
         for _ in range(n_rounds):
