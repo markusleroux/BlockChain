@@ -131,7 +131,7 @@ class BloomFilter:
 
     Notes: (default) murmur hash is a 32 bit int
     '''
-    def __init__(self, N: int, P: float):
+    def __init__(self, N: int, P: float = 0.1):
         self.N = N
         self.P = P
         self.size = self.get_size(N, P)
@@ -204,10 +204,10 @@ BloomResponseType = dict[Union[TxID, bytes], tuple[BlockHeight, Transaction, mer
 
 
 class SimplifiedPaymentVerification:
-    def __init__(self, headers: list[BlockHeader] = [], txids: set[TxID] = set(), pubkeys: set[bytes] = set()):
-        self.headers: list[BlockHeader] = headers
-        self.interesting_txids: set[TxID] = txids
-        self.interesting_pubkeys: set[bytes] = pubkeys
+    def __init__(self, headers: list[BlockHeader] = None, txids: set[TxID] = None, pubkeys: set[bytes] = None):
+        self.headers: list[BlockHeader] = headers or list()
+        self.interesting_txids: set[TxID] = txids or set()
+        self.interesting_pubkeys: set[bytes] = pubkeys or set()
 
     def generate_bloom_filter(self, fp: float = 0.1, extra_size: int = 0) -> BloomFilter:
         '''Return a bloom filter describing the iteresting txid and pubkeys.
@@ -272,7 +272,7 @@ class UTXO:
 
 
 class Address(SimplifiedPaymentVerification):
-    def __init__(self, headers: list[BlockHeader] = []):
+    def __init__(self, headers: list[BlockHeader] = None):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
         self._my_utxo: dict[TxID, UTXO] = dict()
         super().__init__(headers = headers, pubkeys = {self.public_key})
@@ -564,8 +564,8 @@ class UTXOSet:
         for tx in block:
             if not tx.is_coinbase:
                 for txi in tx.inputs:
-                    print(txi.prev_txid)
-                    print(txi.output_index)
+                    # print(txi.prev_txid)
+                    # print(txi.output_index)
                     del self._data[txi.prev_txid][1][txi.output_index]
                     if len(self[txi.prev_txid][1]) == 0:
                         del self._data[txi.prev_txid]
@@ -630,11 +630,11 @@ class UTXOSet:
 
 
 class FullNode:
-    def __init__(self, blockchain: BlockChain = BlockChain()):
-        self.blockchain: BlockChain = blockchain
-        self.UTXO_set: UTXOSet = UTXOSet(blockchain)
+    def __init__(self, blockchain: BlockChain = None):
+        self.blockchain: BlockChain = blockchain or BlockChain()
+        self.UTXO_set: UTXOSet = UTXOSet(self.blockchain)
 
-    def add_block(self, block):
+    def add_block(self, block: Block):
         self.UTXO_set.update(block)
         self.blockchain.add_block(block)
 
@@ -694,12 +694,15 @@ class Miner:
         locking_script = LockingScript(receiver_pubkey, tx_type = tx_type)
         tx_output = TxOutput(value, locking_script)
 
-        return Transaction([tx_input], [tx_output])
+        tx = Transaction([tx_input], [tx_output])
+        print("adding coinbase: {}".format(hash(tx)))
+        self.address.interesting_txids.add(hash(tx))
+
+        return tx
 
     def create_block(self, transactions: list[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
         cb_tx: Transaction = self.create_coinbase_tx(self.address.public_key, 50)
-        self.address.interesting_txids.add(hash(cb_tx))
         if len(self.address.headers) == 0:
             assert(len(transactions) == 0)      # no possible non-coinbase transactions in genesis block
             return Block([cb_tx], None)
@@ -720,7 +723,7 @@ class NetworkControl:
         self.full_nodes: set[FullNode] = set((FullNode() for _ in range(n_full_nodes)))
         self.tx_queue: list[Transaction] = []
 
-    def add_miner(self, headers: list[BlockHeader] = []):
+    def add_miner(self, headers: list[BlockHeader] = None):
         '''Add a new miner to the set of miners and add their address to the list of addresses.'''
         miner = Miner(headers)
         self.addresses[hash(miner.address)] = miner.address
@@ -768,10 +771,11 @@ class NetworkControl:
         for fn in filter(lambda fn: fn.validate_block(block), self.full_nodes):
             fn.add_block(block)
 
-        print('\nWealth: ')
         for address in self.addresses.values():
             address.headers.append(block.header)
-            print(address.wealth, end=',')
+
+        print('\nWealth: ')
+        print(','.join(str(address.wealth) for address in self.addresses.values()))
         print('\n')
         
         # temporary solution
@@ -783,6 +787,7 @@ class NetworkControl:
             print(fn.blockchain)
 
         for address in self.addresses.values():
+            print(address.interesting_txids)
             bloom = address.generate_bloom_filter()
             full_node = random.choice(list(self.full_nodes))
             bloom_response = full_node.filter_block(-1, bloom)
