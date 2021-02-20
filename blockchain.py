@@ -22,7 +22,7 @@ OutputIndex = int
 
 
 def sha256_hash(item: bytes) -> int:
-    """Helper function which constructs a hash from an iterable list of hashable items"""
+    """Helper function which constructs a (32-byte) hash from an iterable list of hashable items"""
     return int.from_bytes(hashlib.sha256(item).digest(), 'big')
 
 
@@ -94,9 +94,9 @@ class TxInput:
 class Transaction:
     inputs: list[TxInput]
     outputs: list[TxOutput]
-    is_coinbase: bool = False
 
-    def is_vaild_coinbase(self):
+    @property
+    def is_coinbase(self):
         '''Return True if and only if this is a valid coinbase transaction.
 
         Conditions:
@@ -105,15 +105,13 @@ class Transaction:
             - the previous txid in that input is 0
             - the output index in that input is 0
             - the value of the output is less than 50
-            - the transaction is marked coinbase
 
 
         '''
         return len(self.inputs) == 1 and \
             self.inputs[0].prev_txid == 0 and \
-            self.inputs[0].outputs_index == 0 and \
-            sum(o.value for o in self.outputs) < 50 and \
-            self.is_coinbase
+            self.inputs[0].output_index == 0 and \
+            sum(o.value for o in self.outputs) <= 50
 
     def __hash__(self) -> TxID:
         # This is a really bad way to do this
@@ -129,8 +127,9 @@ class Transaction:
 class BloomFilter:
     '''Bloom filters allow for efficient descriptions of subsets of transactions.
        https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki#filter-matching-algorithm
+       https://eprint.iacr.org/2014/763.pdf
 
-
+    Notes: (default) murmur hash is a 32 bit int
     '''
     def __init__(self, N: int, P: float):
         self.N = N
@@ -144,13 +143,20 @@ class BloomFilter:
         for i in range(self.n_hashes):
             # Index error?
             if isinstance(item, TxID):
-                self.bitarray[mmh3.hash(item.to_bytes(8, 'big'), i)] = True
+                self.bitarray[self.filter_hash(item.to_bytes(8, 'big'), i)] = True
             else:
-                self.bitarray[mmh3.hash(item, i)] = True
+                self.bitarray[self.filter_hash(item, i)] = True
+
+    def filter_hash(self, item: bytes, hash_index: int):
+        # mod to ensure list index is in range (colisions are not so important)
+        return mmh3.hash(item, hash_index, signed = False) % self.size - 1
 
     def check(self, item: Union[TxID, bytes]) -> bool:
         '''Check if an item is in the filter.'''
-        return all(self.bitarray(mmh3.hash(item, i)) for i in range(self.n_hashes))
+        if isinstance(item, TxID):
+            return all(self.bitarray[self.filter_hash(item.to_bytes(8, 'big'), i)] for i in range(self.n_hashes))
+        else:
+            return all(self.bitarray[self.filter_hash(item, i)] for i in range(self.n_hashes))
 
     @staticmethod
     def get_size(N: int, P: float) -> int:
@@ -165,7 +171,18 @@ class BloomFilter:
 
 
         '''
-        return int(((-1 / (math.log(2)**2)) * N * math.log(P)) / 8)
+        return int(- N * math.log(P) / math.log(2)**2)
+        # return int(((-1 / (math.log(2)**2)) * N * math.log(P)) / 8)
+
+    # @staticmethod
+    # def get_n_bytes(S: int):
+    #     '''Return the maximum number of bytes a digest can be and fit in the filter.'''
+    #     n = 0
+    #     while S > 256:
+    #         S >>= 8     # bit shift one byte
+    #         n += 1
+
+    #     return n
 
     @staticmethod
     def get_n_hashes(N: int, S: int) -> int:
@@ -179,7 +196,8 @@ class BloomFilter:
 
 
         '''
-        return int(S * N * math.log(2) / 8)
+        return int(math.log(2) * S / N)
+        # return int(S * N * math.log(2) / 8)
 
 
 BloomResponseType = dict[Union[TxID, bytes], tuple[BlockHeight, Transaction, merklelib.AuditProof]]
@@ -263,12 +281,12 @@ class Address(SimplifiedPaymentVerification):
     def wealth(self) -> float:
         return sum(utxo.value for utxo in self._my_utxo.values() if utxo._pending)
 
-    def has_pending(self) -> bool:
-        return any(utxo._pending for utxo in self._my_utxo.values())
-
     @property
     def pending_txs(self) -> set[UTXO]:
         return {utxo for utxo in self._my_utxo.values() if utxo._pending}
+
+    def has_pending(self) -> bool:
+        return len(self.pending_txs) > 0
 
     @property
     def public_key(self) -> bytes:
@@ -440,7 +458,7 @@ class Block:
         '''Return True if/only if the block contains at most one coinbase and it is valid.'''
         count = 0
         for coinbase in filter(lambda tx: tx.is_coinbase, self):
-            if not coinbase.is_vaild_coinbase:
+            if not coinbase.is_coinbase:
                 return False
             count += 1
         return count <= 1
@@ -500,7 +518,7 @@ class BlockChain:
         NotImplemented
 
     def __str__(self):
-        return "\n".join(block.__str__() for block in self)
+        return "Blockchain:\n----------- \n" + "\n\n".join(block.__str__() for block in self) + '\n------------\n'
 
 
 class UTXOSet:
@@ -544,8 +562,10 @@ class UTXOSet:
             raise InvalidBlock(block)
 
         for tx in block:
-            if self.height > 0:
+            if not tx.is_coinbase:
                 for txi in tx.inputs:
+                    print(txi.prev_txid)
+                    print(txi.output_index)
                     del self._data[txi.prev_txid][1][txi.output_index]
                     if len(self[txi.prev_txid][1]) == 0:
                         del self._data[txi.prev_txid]
@@ -558,14 +578,14 @@ class UTXOSet:
     def only_spendable_input(self, block: Block):
         '''Determine if all TxInput uses spendable TxOutput
 
-        Conditions
+        Conditions (only for non-coinbase)
         ----------
             - txo referenced by txi is in utxo_set
             - txi unlocking script unlocks locking script of referenced txi
 
 
         '''
-        for tx in block:
+        for tx in filter(lambda b: not b.is_coinbase, block):
             for txi in tx.inputs:
                 try:
                     tx_output_dict = self[txi.prev_txid][1]
@@ -580,7 +600,7 @@ class UTXOSet:
         '''Return True if and only if no tx spends more output than the utxo it claims.
 
         This exludes the coinbase tx, which may spend up to a fixed amount
-        without reference to utxo. See Transaction.is_valid_coinbase()
+        without reference to utxo. See Transaction.is_coinbase
 
 
         '''
@@ -640,7 +660,7 @@ class FullNode:
         if not block.no_internal_double_spend() or not block.one_valid_coinbase():
             return False
 
-        if not self.UTXO_set.no_overspend(block) or self.UTXO_set.only_spendable_input(block):
+        if not self.UTXO_set.no_overspend(block) or not self.UTXO_set.only_spendable_input(block):
             return False
 
         return True
@@ -674,7 +694,7 @@ class Miner:
         locking_script = LockingScript(receiver_pubkey, tx_type = tx_type)
         tx_output = TxOutput(value, locking_script)
 
-        return Transaction([tx_input], [tx_output], is_coinbase=True)
+        return Transaction([tx_input], [tx_output])
 
     def create_block(self, transactions: list[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
@@ -748,15 +768,20 @@ class NetworkControl:
         for fn in filter(lambda fn: fn.validate_block(block), self.full_nodes):
             fn.add_block(block)
 
+        print('\nWealth: ')
         for address in self.addresses.values():
             address.headers.append(block.header)
-            print(address.wealth)
-
+            print(address.wealth, end=',')
+        print('\n')
+        
         # temporary solution
         self.dequeue_txs(len(block._transactions))
 
     def simulate_query_round(self):
         '''Simulate the communication between full nodes and addresses to verify payments.'''
+        for fn in self.full_nodes:
+            print(fn.blockchain)
+
         for address in self.addresses.values():
             bloom = address.generate_bloom_filter()
             full_node = random.choice(list(self.full_nodes))
@@ -764,14 +789,13 @@ class NetworkControl:
             address.process_proofs(bloom_response)
 
     def simulate_n_rounds(self, n_rounds):
+        print('\nInitial Round:')
         block = self.simulate_mining_round()
-        for tx in block._transactions:
-            print(tx)
-
         self.simulate_verification_round(block)
         self.simulate_query_round()
 
-        for _ in range(n_rounds):
+        for iteration in range(n_rounds):
+            print('\nIteration: {}'.format(iteration))
             self.simulate_trading_round()
             block = self.simulate_mining_round()
             self.simulate_verification_round(block)
