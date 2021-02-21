@@ -5,6 +5,8 @@ from typing import Sequence, Optional, Union                # type hints
 from collections import namedtuple
 from functools import reduce                                # fold
 from dataclasses import dataclass, field, InitVar           # class magic
+import logging
+import itertools
 import operator                                             # non-infix addition
 import time                                                 # timestamp
 import random                                               # randomness in network control
@@ -27,7 +29,7 @@ def sha256_hash(item: bytes) -> int:
     return int.from_bytes(hashlib.sha256(item).digest(), 'big')
 
 
-@dataclass
+@dataclass(frozen = True)
 class LockingScript:
     pubkey: bytes
     tx_type: str = "p2pk"
@@ -39,6 +41,7 @@ class LockingScript:
             raise NotImplementedError
 
     def unlock(self, unlocking_script: UnlockingScript) -> bool:
+        '''Return True if and only if the unlocking script unlocks this locking script.'''
         if unlocking_script.tx_type != self.tx_type:
             return False
 
@@ -77,6 +80,9 @@ class TxOutput:
         return sha256_hash(
             self.value.to_bytes(4, 'big') + self.locking_script.to_bytes())
 
+    def __str__(self):
+        return "({}) ".format(self.value) + str(self.pubkey)
+
 
 @dataclass
 class TxInput:
@@ -87,16 +93,28 @@ class TxInput:
         '''Get the txid and output_index from UTXO and discard UTXO'''
         self.prev_txid: TxID = utxo.txid
         self.output_index: OutputIndex = utxo.output_index
+        self.value = utxo.value
 
     @property
     def pubkey(self):
         return self.unlocking_script.pubkey
+
+    def __eq__(self, other):
+        if isinstance(other, TxInput):
+            return self.unlocking_script == other.unlocking_script and \
+                self.prev_txid == other.prev_txid and \
+                self.output_index == other.output_index
+        else:
+            return False
 
     def __hash__(self):
         return sha256_hash(
             reduce(operator.add, (self.prev_txid.to_bytes(32, 'big'),
                                   self.output_index.to_bytes(4, 'big'),
                                   self.unlocking_script.to_bytes())))
+
+    def __str__(self):
+        return str(self.pubkey) + " ({})".format(self.value)
 
 
 @dataclass
@@ -129,8 +147,16 @@ class Transaction:
         return sha256_hash(result)
 
     def __str__(self):
-        return "INPUTS:\n" + "\n".join(str(i) for i in self.inputs) + \
-            "\nOUTPUTS:\n" + "\n".join(str(o) for o in self.outputs)
+        result = "-------------------------------------------------\n"
+        non_coinbase_input = filter(lambda txi: txi.value > 0, self.inputs)
+        max_length = max((len(str(i)) for i in non_coinbase_input), default = 15) + 15
+        result += "Transaction: {}\n".format(hash(self))
+        result += "{0:{2}} | {1}\n".format("Inputs", "Outputs", max_length)
+        result += "{0:{2}}   {1}\n".format("------", "-------", max_length)
+        for i, o in itertools.zip_longest(non_coinbase_input, self.outputs):
+            result += "{0:{2}} | {1}\n".format(str(i), str(o), max_length)
+
+        return result + "-------------------------------------------------\n"
 
 
 class BloomFilter:
@@ -152,11 +178,13 @@ class BloomFilter:
         for i in range(self.n_hashes):
             # Index error?
             if isinstance(item, TxID):
+                logging.info('Adding txid {} to bloom filter.'.format(str(item)))
                 self.bitarray[self.filter_hash(item.to_bytes(32, 'big'), i)] = True
             else:
+                logging.info('Adding pubkey {} to bloom filter.'.format(str(item)))
                 self.bitarray[self.filter_hash(item, i)] = True
 
-    def filter_hash(self, item: bytes, hash_index: int):
+    def filter_hash(self, item: bytes, hash_index: int) -> int:
         # mod to ensure list index is in range (colisions are not so important)
         return mmh3.hash(item, hash_index, signed = False) % self.size - 1
 
@@ -238,14 +266,17 @@ class SimplifiedPaymentVerification:
         interesting_proofs = set()
         for txid, (height, tx, proof) in proofs.items():
             if txid in self.interesting_txids:
+                logging.info('Found interesting txid in proof.'.format(str(txid)))
                 interesting_proofs.add(txid)
                 continue
 
-            if any(True for txi in tx.inputs if txi.unlocking_script.pubkey in self.interesting_pubkeys):
+            if any(True for txi in tx.inputs if txi.pubkey in self.interesting_pubkeys):
+                logging.info('Found interesting txid {} in proof.'.format(str(txid)))
                 interesting_proofs.add(txid)
                 continue
 
-            if any(True for txo in tx.outputs if txo.locking_script.pubkey in self.interesting_pubkeys):
+            if any(True for txo in tx.outputs if txo.pubkey in self.interesting_pubkeys):
+                logging.info('Found interesting txid {} in proof.'.format(str(txid)))
                 interesting_proofs.add(txid)
 
         return {txid: proofs[txid] for txid in interesting_proofs}
@@ -253,6 +284,15 @@ class SimplifiedPaymentVerification:
     def check_proofs(self, block_height: BlockHeight, tx: Transaction, proof: merklelib.AuditProof) -> bool:
         '''Check a proof against the local version of the blockchain headers'''
         # Decode the merkle_root_hash before using with merklelib
+        result = merklelib.verify_leaf_inclusion(tx, proof,
+                                            merklelib.Hasher(),
+                                            self.headers[block_height].merkle_root_hash.decode())
+
+        if not result:
+            logging.info('Invalid proof for txid {}'.format(str(hash(tx))))
+        else:
+            logging.info('Found valid proof for txid {}'.format(str(hash(tx))))
+
         return merklelib.verify_leaf_inclusion(tx, proof,
                                             merklelib.Hasher(),
                                             self.headers[block_height].merkle_root_hash.decode())
@@ -276,32 +316,35 @@ class Address(SimplifiedPaymentVerification):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
         self._my_utxo: dict[TxID, UTXO] = dict()
         super().__init__(headers = headers, pubkeys = {self.pubkey})
+        logging.info('Address {}: created'.format(str(self.pubkey)))
 
     @property
     def wealth(self) -> int:
+        '''Return the total value of utxo which is not pending.'''
         return sum(utxo.value for utxo in self._my_utxo.values() if not utxo._pending)
 
     @property
     def pending_txs(self) -> set[UTXO]:
+        '''Return all pending utxo'''
         return {utxo for utxo in self._my_utxo.values() if utxo._pending}
-
-    def has_pending(self) -> bool:
-        return len(self.pending_txs) > 0
 
     @property
     def pubkey(self) -> bytes:
-        return self.private_key.verifying_key.to_string()
+        return self.private_key.verifying_key.to_string(encoding='compressed')
 
     def _sign(self, byte_string: bytes):
+        '''Sign the byte_string with addresses private key.'''
         return self.private_key.sign(byte_string)
 
     def _register_incoming_tx(self, tx: Transaction):
         '''Add all utxo in tx attributes to self.pubkey to _my_utxo'''
+        logging.info('Address {}: registering incoming txid {}'.format(str(self.pubkey), str(hash(tx))))
         for index, o in filter(lambda item: item[1].pubkey == self.pubkey, enumerate(tx.outputs)):
             self[hash(tx)] = UTXO(hash(tx), index, o.value)
 
     def _clear_outgoing_tx(self, txid: TxID):
         '''Remove UTXO when NEXT transaction has cleared.'''
+        logging.info('Address {}: clearing txid {} from personal utxo set'.format(str(self.pubkey), str(txid)))
         marked = []
         for utxo in filter(lambda utxo: utxo._pending, self._my_utxo.values()):
             if utxo._pending == txid:
@@ -348,6 +391,11 @@ class Address(SimplifiedPaymentVerification):
 
         for utxo in gathered_utxo:
             utxo._pending = hash(tx)
+
+        logging.info('Address {}: created tx {} with value {} and receiver {}'.format(str(self.pubkey),
+                                                                                      str(hash(tx)),
+                                                                                      str(value),
+                                                                                      str(receiver_pubkey)))
 
         return tx
 
@@ -443,13 +491,7 @@ class Block:
 
         self.header.proof_of_work()
 
-    def contains_txid(self, txid: TxID) -> bool:
-        '''Verify tx specified by txid is contained in block.'''
-        raise NotImplementedError
-        # merklelib uses a different hash
-        # return self.transactions_merkle.verify_leaf_inclusion(txid, self.transactions_merkle.get_proof(txid))
-
-    def no_internal_double_spend(self):
+    def no_internal_double_spend(self) -> bool:
         '''Return True if/only if no utxo is spent twice in the block.'''
         spent_utxo = set()
         for tx in self:
@@ -459,7 +501,7 @@ class Block:
                 spent_utxo.add((txi.prev_txid, txi.output_index))
         return True
 
-    def one_valid_coinbase(self):
+    def one_valid_coinbase(self) -> bool:
         '''Return True if/only if the block contains at most one coinbase and it is valid.'''
         count = 0
         for coinbase in filter(lambda tx: tx.is_coinbase, self):
@@ -472,13 +514,13 @@ class Block:
         yield from self._transactions
 
     def _dump_tx(self, txid: TxID):
-        pass
+        raise NotImplementedError
 
     def __getitem__(self, tx_number: int) -> Transaction:
         return self._transactions[tx_number]
 
     def __setitem__(self, tx_number, transaction: Transaction):
-        NotImplemented
+        raise NotImplementedError
 
     def __hash__(self) -> HeaderHash:
         # The header contains the merkle root hash, which ensures that
@@ -520,7 +562,7 @@ class BlockChain:
         return self._chain[key]
 
     def __setitem__(self, height: BlockHeight, block: Block):
-        NotImplemented
+        raise NotImplementedError
 
     def __str__(self):
         return "Blockchain:\n----------- \n" + "\n\n".join(block.__str__() for block in self) + '\n------------\n'
@@ -578,7 +620,7 @@ class UTXOSet:
 
         self.height += 1
 
-    def only_spendable_input(self, block: Block):
+    def only_spendable_input(self, block: Block) -> bool:
         '''Determine if all TxInput uses spendable TxOutput
 
         Conditions (only for non-coinbase)
@@ -599,7 +641,7 @@ class UTXOSet:
                     return False
         return True
 
-    def no_overspend(self, block: Block):
+    def no_overspend(self, block: Block) -> bool:
         '''Return True if and only if no tx spends more output than the utxo it claims.
 
         This exludes the coinbase tx, which may spend up to a fixed amount
@@ -668,15 +710,15 @@ class FullNode:
 
         return True
 
-    def filter_tx(self, tx: Transaction, bloom: BloomFilter):
+    def filter_tx(self, tx: Transaction, bloom: BloomFilter) -> bool:
         '''Return True if and only if tx is matches against the bloom filter'''
         if bloom.check(hash(tx)):
             return True
 
-        if any(True for txi in tx.inputs if bloom.check(txi.unlocking_script.pubkey)):
+        if any(True for txi in tx.inputs if bloom.check(txi.pubkey)):
             return True
 
-        if any(True for txo in tx.outputs if bloom.check(txo.locking_script.pubkey)):
+        if any(True for txo in tx.outputs if bloom.check(txo.pubkey)):
             return True
 
         return False
@@ -693,10 +735,11 @@ class FullNode:
 
 
 class Miner:
-    def __init__(self, headers):
+    def __init__(self, headers: list[BlockHeader]):
         self.address: Address = Address(headers=headers)
 
     def create_coinbase_tx(self, receiver_pubkey, value, tx_type = "p2pk"):
+        '''Create a coinbase transaction.'''
         # we use our own private/public key for type checking, but anything is valid
         unlocking_script = UnlockingScript(self.address.private_key, self.address.pubkey, tx_type="p2pk")
         tx_input = TxInput(unlocking_script, UTXO(0, 0, 0))
@@ -731,7 +774,7 @@ class NetworkControl:
 
     def add_miner(self, headers: list[BlockHeader] = None):
         '''Add a new miner to the set of miners and add their address to the list of addresses.'''
-        miner = Miner(headers)
+        miner = Miner(headers or list())
         self.addresses[hash(miner.address)] = miner.address
         self.miners.add(miner)
 
@@ -751,7 +794,7 @@ class NetworkControl:
                 proportion = random.randrange(11) / 10
 
                 # Choose some number of recipients to recieve a part of the money
-                # n_recipients = random.randrange(1, 6)
+                # n_recipients = random.randrange(1, 3)
                 n_recipients = 1
                 for _ in range(n_recipients):
                     tx_value = int(address.wealth * proportion / n_recipients)
@@ -760,7 +803,7 @@ class NetworkControl:
                     tx = address.create_transaction(tx_value, recipient.pubkey)
                     self.enqueue_tx(tx)
 
-    def simulate_mining_round(self, block_size = 10) -> Block:
+    def simulate_mining_round(self, block_size: int = 10) -> Block:
         '''Simulate multiple miners competing to finish a block.'''
         best_time = None
         for miner in self.miners:
@@ -800,10 +843,11 @@ class NetworkControl:
         print(','.join(str(address.wealth) for address in self.addresses.values()), end = ' | ')
         print(sum(address.wealth for address in self.addresses.values()))
 
-    def simulate_n_rounds(self, n_rounds):
+    def simulate_n_rounds(self, n_rounds: int):
         print('\nInitial Round:')
         block = self.simulate_mining_round()
         self.simulate_verification_round(block)
+        print(block[0])
         self.simulate_query_round()
 
         for iteration in range(n_rounds):
@@ -814,5 +858,5 @@ class NetworkControl:
             self.simulate_query_round()
 
 
-nc = NetworkControl(20, 2, 1)
-nc.simulate_n_rounds(3)
+nc = NetworkControl(20, 5, 1)
+nc.simulate_n_rounds(9)
