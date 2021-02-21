@@ -2,6 +2,7 @@
 
 from __future__ import annotations                          # type annotations in the future
 from typing import Sequence, Optional, Union                # type hints
+from collections import namedtuple
 from functools import reduce                                # fold
 from dataclasses import dataclass, field, InitVar           # class magic
 import operator                                             # non-infix addition
@@ -68,6 +69,10 @@ class TxOutput:
     value: int
     locking_script: LockingScript
 
+    @property
+    def pubkey(self):
+        return self.locking_script.pubkey
+
     def __hash__(self):
         return sha256_hash(
             self.value.to_bytes(4, 'big') + self.locking_script.to_bytes())
@@ -82,6 +87,10 @@ class TxInput:
         '''Get the txid and output_index from UTXO and discard UTXO'''
         self.prev_txid: TxID = utxo.txid
         self.output_index: OutputIndex = utxo.output_index
+
+    @property
+    def pubkey(self):
+        return self.unlocking_script.pubkey
 
     def __hash__(self):
         return sha256_hash(
@@ -172,17 +181,6 @@ class BloomFilter:
 
         '''
         return int(- N * math.log(P) / math.log(2)**2) + 100
-        # return int(((-1 / (math.log(2)**2)) * N * math.log(P)) / 8)
-
-    # @staticmethod
-    # def get_n_bytes(S: int):
-    #     '''Return the maximum number of bytes a digest can be and fit in the filter.'''
-    #     n = 0
-    #     while S > 256:
-    #         S >>= 8     # bit shift one byte
-    #         n += 1
-
-    #     return n
 
     @staticmethod
     def get_n_hashes(N: int, S: int) -> int:
@@ -197,10 +195,10 @@ class BloomFilter:
 
         '''
         return int(math.log(2) * S / N)
-        # return int(S * N * math.log(2) / 8)
 
 
-BloomResponseType = dict[Union[TxID, bytes], tuple[BlockHeight, Transaction, merklelib.AuditProof]]
+TxWithProof = namedtuple('TxWithProof', 'block_height tx proof')
+BloomResponseType = dict[TxID, TxWithProof]
 
 
 class SimplifiedPaymentVerification:
@@ -235,32 +233,29 @@ class SimplifiedPaymentVerification:
 
         return bloom
 
-    def check_proofs(self, proofs: BloomResponseType, item: Union[TxID, bytes]) -> bool:
-        '''Use the provided proofs to verify the inclusion of txid or pubkey in the chain.'''
-        if isinstance(item, TxID):
-            try:
-                height, _, proof = proofs[item]
-                return merklelib.verify_leaf_inclusion(item, proof,
-                                                    merklelib.Hasher(),
-                                                    hash(self.headers[height]))
-            except KeyError:
-                print("Transaction not in collection of proofs.")
-                return False
+    def clean_bloom_response(self, proofs: BloomResponseType) -> BloomResponseType:
+        '''Remove proofs which were sent due to false positives in the bloom filter'''
+        interesting_proofs = set()
+        for txid, (height, tx, proof) in proofs.items():
+            if txid in self.interesting_txids:
+                interesting_proofs.add(txid)
+                continue
 
-        elif isinstance(item, bytes):
-            try:
-                height, tx, proof = proofs[item]
-                if not merklelib.verify_leaf_inclusion(hash(tx), proof,
-                                                      merklelib.Hasher(),
-                                                      hash(self.headers[height])):
-                    return False
+            if any(True for txi in tx.inputs if txi.unlocking_script.pubkey in self.interesting_pubkeys):
+                interesting_proofs.add(txid)
+                continue
 
-                # AT LEAST one matching pubkey in tx
-                return any(o.locking_script.pubkey == item for o in tx.outputs)
+            if any(True for txo in tx.outputs if txo.locking_script.pubkey in self.interesting_pubkeys):
+                interesting_proofs.add(txid)
 
-            except KeyError:
-                print("Pubkey not in colection of proofs.")
-                return False
+        return {txid: proofs[txid] for txid in interesting_proofs}
+
+    def check_proofs(self, block_height: BlockHeight, tx: Transaction, proof: merklelib.AuditProof) -> bool:
+        '''Check a proof against the local version of the blockchain headers'''
+        # Decode the merkle_root_hash before using with merklelib
+        return merklelib.verify_leaf_inclusion(tx, proof,
+                                            merklelib.Hasher(),
+                                            self.headers[block_height].merkle_root_hash.decode())
 
 
 @dataclass
@@ -271,17 +266,16 @@ class UTXO:
     _pending: Optional[TxID] = field(default=None, init=False)         # store the txid of the spending tx
 
     def __hash__(self):
-        return sha256_hash(
-            reduce(operator.add, (self.txid.to_bytes(32, 'big'),
-                                  self.output_index.to_bytes(4, 'big'),
-                                  self.value.to_bytes(10, 'big'))))
+        return sha256_hash(reduce(operator.add, (self.txid.to_bytes(32, 'big'),
+                                                self.output_index.to_bytes(4, 'big'),
+                                                self.value.to_bytes(10, 'big'))))
 
 
 class Address(SimplifiedPaymentVerification):
     def __init__(self, headers: list[BlockHeader] = None):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
         self._my_utxo: dict[TxID, UTXO] = dict()
-        super().__init__(headers = headers, pubkeys = {self.public_key})
+        super().__init__(headers = headers, pubkeys = {self.pubkey})
 
     @property
     def wealth(self) -> int:
@@ -295,31 +289,26 @@ class Address(SimplifiedPaymentVerification):
         return len(self.pending_txs) > 0
 
     @property
-    def public_key(self) -> bytes:
+    def pubkey(self) -> bytes:
         return self.private_key.verifying_key.to_string()
 
     def _sign(self, byte_string: bytes):
         return self.private_key.sign(byte_string)
 
-    def _incoming_tx(self, tx: Transaction):
+    def _register_incoming_tx(self, tx: Transaction):
         '''Add all utxo in tx attributes to self.pubkey to _my_utxo'''
-        for i, o in ((i, o) for i, o in enumerate(tx.outputs) if o.locking_script.pubkey == self.public_key):
-            print("\nAddress: " + str(self.public_key))
-            print('adding {} to UTXO set'.format(hash(tx)))
-            self[hash(tx)] = UTXO(hash(tx), i, o.value)
+        for index, o in filter(lambda item: item[1].pubkey == self.pubkey, enumerate(tx.outputs)):
+            self[hash(tx)] = UTXO(hash(tx), index, o.value)
 
-    def _clear_pending_tx(self, txid: TxID):
+    def _clear_outgoing_tx(self, txid: TxID):
         '''Remove UTXO when NEXT transaction has cleared.'''
         marked = []
         for utxo in filter(lambda utxo: utxo._pending, self._my_utxo.values()):
             if utxo._pending == txid:
-                print('{} marked for deletion'.format(utxo.txid))
                 marked.append(utxo.txid)
 
         for utxid in marked:
             del self._my_utxo[utxid]
-
-        self.interesting_txids.remove(txid)
 
     def _gather_utxos(self, value: int) -> tuple[set[UTXO], int]:
         '''Get a set of UTXO with combined value greater than value.'''
@@ -344,21 +333,18 @@ class Address(SimplifiedPaymentVerification):
         (gathered_utxo, extra_value) = self._gather_utxos(value)
         for utxo in gathered_utxo:
             unlocking_script = UnlockingScript(self.private_key,
-                                               self.public_key,
+                                               self.pubkey,
                                                tx_type=tx_type)
             inputs.append(TxInput(unlocking_script, utxo))
 
         locking_script = LockingScript(receiver_pubkey, tx_type=tx_type)
-        locking_script_for_change = LockingScript(self.public_key,
+        locking_script_for_change = LockingScript(self.pubkey,
                                                   tx_type=tx_type)
 
         outputs.append(TxOutput(value, locking_script))
         outputs.append(TxOutput(extra_value, locking_script_for_change))
 
         tx = Transaction(inputs, outputs)
-        print("\nAddress: " + str(self.public_key))
-        print('adding {} to interesting'.format(hash(tx)))
-        self.interesting_txids.add(hash(tx))
 
         for utxo in gathered_utxo:
             utxo._pending = hash(tx)
@@ -371,22 +357,18 @@ class Address(SimplifiedPaymentVerification):
 
 
         '''
-        for item in proofs.keys():
-            # print("item: {}".format(item))
-            if isinstance(item, TxID):
-                # we only watch TxID of outgoing
-                try:
-                    self._clear_pending_tx(item)
-                except KeyError:
-                    pass
-            elif isinstance(item, bytes):
-                # we only watch pubkey for incoming tx
-                self._incoming_tx(proofs[item][1])
-            else:
-                print("no proof match")
+        for txid, (block_height, tx, proof) in self.clean_bloom_response(proofs).items():
+            if not self.check_proofs(block_height, tx, proof):
+                print("proof for txid {} invalid".format(txid))
+                continue
 
-        if len(self._my_utxo) > 0:
-            print('UTXO Set: ' + ', '.join(str((utxo.txid, utxo.value)) for utxo in self._my_utxo.values()))
+            for txi in tx.inputs:
+                if txi.pubkey == self.pubkey:
+                    self._clear_outgoing_tx(txid)
+
+            for txo in tx.outputs:
+                if txo.pubkey == self.pubkey:
+                    self._register_incoming_tx(tx)
 
     def __getitem__(self, key):
         return self._my_utxo[key]
@@ -395,7 +377,7 @@ class Address(SimplifiedPaymentVerification):
         self._my_utxo[key] = value
 
     def __hash__(self):
-        return sha256_hash(self.public_key)
+        return sha256_hash(self.pubkey)
 
 
 class BlockHeader:
@@ -463,7 +445,9 @@ class Block:
 
     def contains_txid(self, txid: TxID) -> bool:
         '''Verify tx specified by txid is contained in block.'''
-        return self.transactions_merkle.verify_leaf_inclusion(txid, self.transactions_merkle.get_proof(txid))
+        raise NotImplementedError
+        # merklelib uses a different hash
+        # return self.transactions_merkle.verify_leaf_inclusion(txid, self.transactions_merkle.get_proof(txid))
 
     def no_internal_double_spend(self):
         '''Return True if/only if no utxo is spent twice in the block.'''
@@ -585,8 +569,6 @@ class UTXOSet:
         for tx in block:
             if not tx.is_coinbase:
                 for txi in tx.inputs:
-                    # print(txi.prev_txid)
-                    # print(txi.output_index)
                     del self._data[txi.prev_txid][1][txi.output_index]
                     if len(self[txi.prev_txid][1]) == 0:
                         del self._data[txi.prev_txid]
@@ -686,21 +668,26 @@ class FullNode:
 
         return True
 
+    def filter_tx(self, tx: Transaction, bloom: BloomFilter):
+        '''Return True if and only if tx is matches against the bloom filter'''
+        if bloom.check(hash(tx)):
+            return True
+
+        if any(True for txi in tx.inputs if bloom.check(txi.unlocking_script.pubkey)):
+            return True
+
+        if any(True for txo in tx.outputs if bloom.check(txo.locking_script.pubkey)):
+            return True
+
+        return False
+
     def filter_block(self, height: BlockHeight, bloom: BloomFilter) -> BloomResponseType:
         '''Filter a block for matches agains a bloom filter'''
         response: BloomResponseType = dict()
         block = self.blockchain[height]
-        for tx in block:
-            if bloom.check(hash(tx)):
-                proof = block.transactions_merkle.get_proof(hash(tx))
-                response[hash(tx)] = (height, tx, proof)
-
-            for output in tx.outputs:
-                pubkey = output.locking_script.pubkey
-                if bloom.check(pubkey):
-                    print('found pubkey in tx with id {}'.format(hash(tx)))
-                    proof = block.transactions_merkle.get_proof(hash(tx))
-                    response[pubkey] = (height, tx, proof)
+        for tx in filter(lambda tx: self.filter_tx(tx, bloom), block):
+            proof = block.transactions_merkle.get_proof(tx)
+            response[hash(tx)] = TxWithProof(block_height = height, tx = tx, proof = proof)
 
         return response
 
@@ -711,21 +698,17 @@ class Miner:
 
     def create_coinbase_tx(self, receiver_pubkey, value, tx_type = "p2pk"):
         # we use our own private/public key for type checking, but anything is valid
-        unlocking_script = UnlockingScript(self.address.private_key, self.address.public_key, tx_type="p2pk")
+        unlocking_script = UnlockingScript(self.address.private_key, self.address.pubkey, tx_type="p2pk")
         tx_input = TxInput(unlocking_script, UTXO(0, 0, 0))
 
         locking_script = LockingScript(receiver_pubkey, tx_type = tx_type)
         tx_output = TxOutput(value, locking_script)
 
-        tx = Transaction([tx_input], [tx_output])
-        # print("adding coinbase: {}".format(hash(tx)))
-        # self.address.interesting_txids.add(hash(tx))
-
-        return tx
+        return Transaction([tx_input], [tx_output])
 
     def create_block(self, transactions: list[Transaction]) -> Block:
         '''Create a new block from a list of transactions.'''
-        cb_tx: Transaction = self.create_coinbase_tx(self.address.public_key, 50)
+        cb_tx: Transaction = self.create_coinbase_tx(self.address.pubkey, 50)
         if len(self.address.headers) == 0:
             assert(len(transactions) == 0)      # no possible non-coinbase transactions in genesis block
             return Block([cb_tx], None)
@@ -773,8 +756,8 @@ class NetworkControl:
                 for _ in range(n_recipients):
                     tx_value = int(address.wealth * proportion / n_recipients)
                     recipient = random.choice([ad for ad in self.addresses.values()
-                                               if ad.public_key != address.public_key])
-                    tx = address.create_transaction(tx_value, recipient.public_key)
+                                               if ad.pubkey != address.pubkey])
+                    tx = address.create_transaction(tx_value, recipient.pubkey)
                     self.enqueue_tx(tx)
 
     def simulate_mining_round(self, block_size = 10) -> Block:
@@ -788,8 +771,8 @@ class NetworkControl:
             if not best_time or elapsed < best_time:
                 fastest_block, best_time = block, elapsed
 
-        for tx in filter(lambda tx: tx.is_coinbase, fastest_block):
-            print('{} created'.format(hash(tx)))
+        # for tx in filter(lambda tx: tx.is_coinbase, fastest_block):
+            # print('Coinbase {} created'.format(hash(tx)))
 
         return fastest_block
 
@@ -797,7 +780,6 @@ class NetworkControl:
         '''Simulate block validation by full nodes.'''
         # Full nodes which are able to verify add the block
         for fn in filter(lambda fn: fn.validate_block(block), self.full_nodes):
-            print('validated!')
             fn.add_block(block)
 
         for address in self.addresses.values():
@@ -808,19 +790,15 @@ class NetworkControl:
 
     def simulate_query_round(self):
         '''Simulate the communication between full nodes and addresses to verify payments.'''
-        # for fn in self.full_nodes:
-            # print(fn.blockchain)
-
         for address in self.addresses.values():
-            # if len(address.interesting_txids) > 0:
-                # print(address.interesting_txids)
             bloom = address.generate_bloom_filter()
             full_node = random.choice(list(self.full_nodes))
             bloom_response = full_node.filter_block(-1, bloom)
             address.process_proofs(bloom_response)
 
         print('\nWealth: ')
-        print(','.join(str(address.wealth) for address in self.addresses.values()))
+        print(','.join(str(address.wealth) for address in self.addresses.values()), end = ' | ')
+        print(sum(address.wealth for address in self.addresses.values()))
 
     def simulate_n_rounds(self, n_rounds):
         print('\nInitial Round:')
@@ -838,6 +816,3 @@ class NetworkControl:
 
 nc = NetworkControl(20, 2, 1)
 nc.simulate_n_rounds(3)
-
-# created block is not always registered
-# l 703 is overwriting when someone recieves coinbase and recieves from tx
