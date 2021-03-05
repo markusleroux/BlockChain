@@ -2,8 +2,7 @@ import random
 import time
 
 from blockchain import Transaction, BlockHeader, Block
-from nodes import FullNode, Miner
-from address import Address
+from nodes import FullNode, Miner, Address
 
 
 class NetworkControl:
@@ -60,9 +59,6 @@ class NetworkControl:
             elapsed = end - start
             if not best_time or elapsed < best_time:
                 fastest_block, best_time = block, elapsed
-
-        # for tx in filter(lambda tx: tx.is_coinbase, fastest_block):
-        # print('Coinbase {} created'.format(hash(tx)))
 
         return fastest_block
 
