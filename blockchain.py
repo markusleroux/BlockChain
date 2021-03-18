@@ -11,7 +11,7 @@ from typing import Sequence  # type hints
 import ecdsa  # elliptic curve keys
 import merklelib  # merkle tree
 
-from nodes import UTXO
+import nodes
 
 OutputIndex = int
 TxID = int
@@ -82,9 +82,9 @@ class TxOutput:
 @dataclass
 class TxInput:
     unlocking_script: UnlockingScript
-    utxo: InitVar[UTXO]
+    utxo: InitVar[nodes.UTXO]
 
-    def __post_init__(self, utxo: UTXO):
+    def __post_init__(self, utxo: nodes.UTXO):
         """Get the txid and output_index from UTXO and discard UTXO"""
         self.prev_txid: TxID = utxo.txid
         self.output_index: OutputIndex = utxo.output_index
