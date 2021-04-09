@@ -1,12 +1,8 @@
-import logging
 import math
 import operator
 from dataclasses import dataclass, field
 from functools import reduce
 from typing import Optional, Union
-import socket
-import select
-import pickle
 
 import bitarray
 import ecdsa
@@ -18,6 +14,8 @@ from blockchain import OutputIndex, TxOutput, TxID, sha256_hash, BlockChain, Blo
     Transaction, BlockHeader, UnlockingScript, TxInput, LockingScript
 
 import logger as log
+import messaging as tcp
+
 
 @dataclass
 class ProofData:
@@ -40,6 +38,7 @@ class UTXO:
         return sha256_hash(reduce(operator.add, (self.txid.to_bytes(32, 'big'),
                                                  self.output_index.to_bytes(4, 'big'),
                                                  self.value.to_bytes(10, 'big'))))
+
 
 class BloomFilter:
     """Bloom filters allow for efficient descriptions of subsets of transactions.
@@ -106,91 +105,7 @@ class BloomFilter:
         return int(- number_of_items * math.log(fp) / math.log(2) ** 2) + 100
 
 
-class Messaging:
-    self.MAX_TCP_MSG_SIZE = 2048
-
-    @staticmethod
-    def send(sock, obj):
-        sock.sendall(len(bs).to_bytes(4) + pickle.dumps(obj))
-
-    @staticmethod
-    def receive(sock):
-        """Reconstruct object from pickle data recieved by stream.
-
-        Notes:
-        - must already be listening on sock
-        - does not close socket
-
-        """
-        len_bytes = b''
-        while len(len_bytes) < 4:
-            len_bs += int.from_bytes(sock.recv(32))
-
-        l = int.from_bytes(len_bs)
-            
-        received = 0
-        pieces = []
-        while i < len_bytes:
-            pieces.append(sock.recv(min(self.MAX_TCP_MSG_SIZE, l - received)))
-            if pieces[-1] == b'':
-                raise RuntimeError()
-
-            received += len(pieces[-1])
-
-        return pickle.loads(b''.join(pieces))
-
-
-HandlingFunction = Callable[[Socket], None]
-
-
-class TCPServer(Messaging):
-    @staticmethod
-    def __serve(self, ports: dict[int, HandlingFunction], **options):
-        """Use the handling functions to serve incoming tcp connections on specific ports.
-
-        options
-        -------
-        blocking : bool (False)
-            blocking or non-blocking sockets
-        host : str ("")
-            the host to bind to
-        max_requests : int (5)
-
-
-        """
-
-        socks = dict()
-        for port, f in ports.items():
-            socks[port] = socket.socket()       # INET Streaming socket
-            socks[port].setblocking(options.get(blocking, False))
-            socks[port].bind((options.get(host, ""), port))
-            socks[port].listen(options.get(max_requests, 5))
-
-        while True:
-            read, writes, errors = ports.values(), [], []
-            notified_sockets = select.select(reads, writes, errors, options.get(timeout, 60))[0]
-            for ns in notified_sockets:
-                sock, addr = ns.accept()
-                if ns in ports.keys():
-                    ports[ns](sock)
-
-
-class TCPClient(Messaging):
-    @staticmethod
-    def connect(port, addr):
-        sock = socket.socket()
-        sock.connect((addr, port))
-        return sock
-
-    @staticmethod
-    def send_receive(port, addr, obj):
-        TCPClient.connect(port, addr)
-        Messaging.send(sock, bloom)
-        response = Messaging.receive(sock)
-        sock.close()
-        return response
-
-class SimplifiedPaymentVerification(TCPClient):
+class SimplifiedPaymentVerification(tcp.Client):
     @log.objectID
     def __init__(self, headers: list[BlockHeader] = None, txids: set[TxID] = None, pubkeys: set[bytes] = None):
         self.headers: list[BlockHeader] = headers or list()
@@ -229,8 +144,8 @@ class SimplifiedPaymentVerification(TCPClient):
         else:
             return f'Invalid proof for txid {hash(pd.tx)}'
 
-    @log.log_object(check_proofs_log_message, level = "debug", pass_result = True)
-    @log.log_object(lambda self, pd : f'Verifying proof for txid {hash(pd.tx)}')
+    @log.node(check_proofs_log_message, level = "debug", pass_result = True)
+    @log.node(lambda self, pd : f'Verifying proof for txid {hash(pd.tx)}')
     def check_proofs(self, proof_data: ProofData) -> bool:
         """Check a proof against the local version of the blockchain headers"""
         # Decode the merkle_root_hash before using with merklelib
@@ -262,7 +177,7 @@ class SimplifiedPaymentVerification(TCPClient):
         return {txid: proofs[txid] for txid in interesting_proofs}
 
     def request_headers(self, addr):
-        """Request missing headers using TCP and wait for a list of headers."""
+        """Request missing headers and wait for a list of headers."""
         NotImplemented
 
 
@@ -290,13 +205,13 @@ class Address(SimplifiedPaymentVerification):
         """Sign the byte_string with addresses private key."""
         return self.private_key.sign(byte_string)
 
-    @log.log_object(lambda self, tx : f'Registering incoming txid {hash(tx)}')
+    @log.node(lambda self, tx : f'Registering incoming txid {hash(tx)}')
     def _register_incoming_tx(self, tx: Transaction):
         """Add all utxo in tx attributes to self.pubkey to _my_utxo"""
         for index, o in filter(lambda item: item[1].pubkey == self.pubkey, enumerate(tx.outputs)):
             self[hash(tx)] = UTXO(hash(tx), index, o.value)
 
-    @log.log_object(lambda self, txid : f'Clearing txid {txid} from personal utxo set')
+    @log.node(lambda self, txid : f'Clearing txid {txid} from personal utxo set')
     def _clear_outgoing_tx(self, txid: TxID):
         """Remove UTXO when NEXT transaction has cleared."""
         marked = []
@@ -323,12 +238,12 @@ class Address(SimplifiedPaymentVerification):
 
         return gathered_utxo, abs(remaining_value)
 
-    @log.log_object(lambda self, tx, value, rpk, txt : f'Created tx {hash(tx)} with value {value} and receiver {rpk}', pass_result = True)
+    @log.node(lambda self, tx, value, rpk, txt : f'Created tx {hash(tx)} with value {value} and receiver {rpk}', pass_result = True)
     def create_transaction(self, value: int, receiver_pubkey: bytes, tx_type: str = 'p2pk') -> Transaction:
         """Return a transaction sending value amount to receiver_pubkey address."""
         inputs, outputs = [], []
 
-        (gathered_utxo, extra_value) = self._gather_utxos(value)
+        gathered_utxo, extra_value = self._gather_utxos(value)
         for utxo in gathered_utxo:
             unlocking_script = UnlockingScript(self.private_key,
                                                self.pubkey,
@@ -336,8 +251,7 @@ class Address(SimplifiedPaymentVerification):
             inputs.append(TxInput(unlocking_script, utxo))
 
         locking_script = LockingScript(receiver_pubkey, tx_type=tx_type)
-        locking_script_for_change = LockingScript(self.pubkey,
-                                                  tx_type=tx_type)
+        locking_script_for_change = LockingScript(self.pubkey, tx_type=tx_type)
 
         outputs.append(TxOutput(value, locking_script))
         outputs.append(TxOutput(extra_value, locking_script_for_change))
@@ -380,14 +294,14 @@ class Address(SimplifiedPaymentVerification):
         return sha256_hash(self.pubkey)
 
 
-class Miner(TCPClient, TCPServer):
+class Miner(tcp.Client, tcp.Server):
     @log.objectID
     def __init__(self, headers: list[BlockHeader]):
         self.address: Address = Address(headers=headers)
         self.known_full_nodes = set()
         self.known_tx = []
 
-    @log.log_object(lambda self, rpk, value, txt : f'Created coinbase tx with value {value} and receiver {rpk}')
+    @log.node(lambda self, rpk, value, txt : f'Created coinbase tx with value {value} and receiver {rpk}')
     def create_coinbase_tx(self, receiver_pubkey, value, tx_type='p2pk'):
         """Create a coinbase transaction."""
         # we use our own private/public key for type checking, but anything is valid
@@ -399,27 +313,27 @@ class Miner(TCPClient, TCPServer):
 
         return Transaction([tx_input], [tx_output])
 
-    @log.log_object(lambda self, txs : f'Created block with {len(txs)} transactions')
+    @log.node(lambda self, txs : f'Created block with {len(txs)} transactions')
     def create_block(self, transactions: list[Transaction]) -> Block:
         """Create a new block from a list of transactions."""
         cb_tx: Transaction = self.create_coinbase_tx(self.address.pubkey, 50)
         if len(self.address.headers) == 0:
-            assert (len(transactions) == 0)  # no possible non-coinbase transactions in genesis block
+            assert(len(transactions) == 0)  # no possible non-coinbase transactions in genesis block
             return Block([cb_tx])
 
         return Block([cb_tx] + transactions, hash(self.address.headers[-1]))
 
     def broadcast_block(self, block):
         for addr, port in self.known_full_nodes:
-            sock = Miner.connect(port, addr)
-            Miner.send(sock, block)
+            sock = tcp.Messaging.connect(port, addr)
+            tcp.Messaging.send(sock, block)
             sock.close()
 
     def serve(self):
         ports = { 9092: self.handle_address,
                   9093: self.handle_new_blocks }
         options = dict()
-        self.__serve(ports, options)
+        super(tcp.Server, tcp.Server).serve(ports, options)
 
     def handle_address(self, sock):
         """Add a new transaction to the list of known transactions not included in the chain."""
@@ -437,7 +351,6 @@ class Miner(TCPClient, TCPServer):
 class UTXOinBlock:
     block_height: int
     output_dict: dict[OutputIndex, TxOutput]
-
 
 
 class UTXOSet:
@@ -535,19 +448,20 @@ class UTXOSet:
     def __delitem__(self, txid: TxID):
         del self._data[txid]
 
-class FullNode(TCPServer):
+
+class FullNode(tcp.Server):
     @log.objectID
     def __init__(self, blockchain: BlockChain = None):
         self.blockchain: BlockChain = blockchain or BlockChain()
         self.UTXO_set: UTXOSet = UTXOSet(self.blockchain)
 
-    @log.log_object(lambda self, block : f'Adding block to blockchain')
+    @log.node(lambda self, block : 'Adding block to blockchain')
     def add_block(self, block: Block):
         self.UTXO_set.update(block)
         self.blockchain.add_block(block)
 
-    @log.log_object(lambda self, result, block : f'Validated block' if result else f'Invalidated block', pass_result = True)
-    @log.log_object(lambda self, block : f'Validating block')
+    @log.node(lambda self, result, block : 'Validated block' if result else 'Invalidated block', pass_result = True)
+    @log.node(lambda self, block : 'Validating block')
     def validate_block(self, block: Block) -> bool:
         """Validate a new block.
 
@@ -581,7 +495,7 @@ class FullNode(TCPServer):
         else:
             return f'Transaction {hash(tx)} did not match against filter', 
 
-    @log.log_object(filter_tx_log_message, level = 'debug', pass_result = True)
+    @log.node(filter_tx_log_message, level = 'debug', pass_result = True)
     @staticmethod
     def filter_tx(tx: Transaction, bloom: BloomFilter) -> bool:
         """Return True if and only if tx is matches against the bloom filter"""
@@ -610,20 +524,17 @@ class FullNode(TCPServer):
         ports = { 9090: self.handle_miner,
                   9091: self.handle_address }
         options = dict()
-        self.__serve(ports, options)
+        super(tcp.Server, tcp.Server).serve(ports, options)
 
     def handle_address(self, sock):
         """Reconstruct bloom filter from stream and respond with proofs."""
-        bloom = receive_all_pickle(sock)
-        bloom_response = self.filter_block(len(self.blockchain) - 1, bloom)
-        response_data = pickle.dumps(bloom_response)
-        sock.send(response_data)
+        bloom = tcp.Messaging.receive(sock)
+        tcp.Messaging.send(self.filter_block(len(self.blockchain) - 1, bloom))
         sock.close()
 
     def handle_miner(self, sock):
         """Reconstruct block from stream and add block to blockchain if valid."""
-        block = receive_all_pickle(sock)
+        block = tcp.Messaging.receive(sock)
         sock.close()
         if self.validate_block(block):
             self.add_block(block)
-

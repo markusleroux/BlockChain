@@ -14,6 +14,7 @@ class CustomAdaptor(logging.LoggerAdapter):
         return '[%s %x] %s' % (self.extra['object_class'], self.extra['object_id'], msg), kwargs
 
 def objectID(init):
+    # add an object ID to an object, which can be used to identify it on the network
     @wraps(init)
     def logged_init(self, *args, **kwargs):
         init(self, *args, **kwargs)
@@ -28,7 +29,27 @@ def objectID(init):
     return logged_init
 
 
-def node_log(lambda_message, level = "info", pass_result = False):
+def node(lambda_message, level = "info", pass_result = False):
+    """Constructs a decorator for logging a message, using the lambda
+    to pull in information to include in the log from the arguments
+    of the call.
+
+    Arguments
+    --------
+    lambda_message : *args -> **kwargs -> str
+        The message to write to the logs
+
+    level : "debug" | "warning" | "error" | "critical" | "info"
+        The level to associate with the log
+    
+    pass_result : bool
+        Whether to pass the result to the logger ( if the result
+        is passed to the logger, the log is constructed after
+        the function is called, and will not be constructed if
+        the function fails )
+
+
+    """
     def logging_decorator(function):
         @wraps(function)
         def logged_function(self, *args, **kwargs):
@@ -43,11 +64,12 @@ def node_log(lambda_message, level = "info", pass_result = False):
             else:
                 logger = self._logging_adapter.info
 
-            result = function(self, *args, **kwargs)
             if pass_result:
+                result = function(self, *args, **kwargs)
                 logger(lambda_message(self, result, *args, **kwargs))
             else:
                 logger(lambda_message(self, *args, **kwargs))
+                result = function(self, *args, **kwargs)
 
             return result
         return logged_function
