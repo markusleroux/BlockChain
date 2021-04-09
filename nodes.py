@@ -95,7 +95,92 @@ class BloomFilter:
         return int(- number_of_items * math.log(fp) / math.log(2) ** 2) + 100
 
 
-class SimplifiedPaymentVerification:
+class Messaging:
+    self.MAX_TCP_MSG_SIZE = 2048
+
+    @staticmethod
+    def send(sock, obj):
+        sock.sendall(len(bs).to_bytes(4) + pickle.dumps(obj))
+
+    @staticmethod
+    def receive(sock):
+        """Reconstruct object from pickle data recieved by stream.
+
+        Notes:
+        - must already be listening on sock
+        - does not close socket
+
+        """
+        len_bytes = b''
+        while len(len_bytes) < 4:
+            len_bs += int.from_bytes(sock.recv(32))
+
+        l = int.from_bytes(len_bs)
+            
+        received = 0
+        pieces = []
+        while i < len_bytes:
+            pieces.append(sock.recv(min(self.MAX_TCP_MSG_SIZE, l - received)))
+            if pieces[-1] == b'':
+                raise RuntimeError()
+
+            received += len(pieces[-1])
+
+        return pickle.loads(b''.join(pieces))
+
+
+HandlingFunction = Callable[[Socket], None]
+
+
+class TCPServer(Messaging):
+    @staticmethod
+    def __serve(self, ports: dict[int, HandlingFunction], **options):
+        """Use the handling functions to serve incoming tcp connections on specific ports.
+
+        options
+        -------
+        blocking : bool (False)
+            blocking or non-blocking sockets
+        host : str ("")
+            the host to bind to
+        max_requests : int (5)
+
+
+        """
+
+        socks = dict()
+        for port, f in ports.items():
+            socks[port] = socket.socket()       # INET Streaming socket
+            socks[port].setblocking(options.get(blocking, False))
+            socks[port].bind((options.get(host, ""), port))
+            socks[port].listen(options.get(max_requests, 5))
+
+        while True:
+            read, writes, errors = ports.values(), [], []
+            notified_sockets = select.select(reads, writes, errors, options.get(timeout, 60))[0]
+            for ns in notified_sockets:
+                sock, addr = ns.accept()
+                if ns in ports.keys():
+                    ports[ns](sock)
+
+
+class TCPClient(Messaging):
+    @staticmethod
+    def connect(port, addr):
+        sock = socket.socket()
+        sock.connect((addr, port))
+        return sock
+
+    @staticmethod
+    def send_receive(port, addr, obj):
+        TCPClient.connect(port, addr)
+        Messaging.send(sock, bloom)
+        response = Messaging.receive(sock)
+        sock.close()
+        return response
+
+
+class SimplifiedPaymentVerification(TCPClient):
     def __init__(self, headers: list[BlockHeader] = None, txids: set[TxID] = None, pubkeys: set[bytes] = None):
         self.headers: list[BlockHeader] = headers or list()
         self.interesting_txids: set[TxID] = txids or set()
@@ -160,16 +245,6 @@ class SimplifiedPaymentVerification:
                 interesting_proofs.add(txid)
 
         return {txid: proofs[txid] for txid in interesting_proofs}
-
-    @staticmethod
-    def send_receive_bloom(bloom: BloomFilter, addr, port=9090) -> BloomResponseType:
-        """Send a bloom filter to a full node using TCP and wait for a bloom response."""
-        sock = socket.socket()
-        sock.connect((addr, port))
-        sock.sendall(pickle.dumps(bloom))
-        bloom_response = receive_all_pickle(sock)
-        sock.close()
-        return bloom_response
 
     def request_headers(self, addr):
         """Request missing headers using TCP and wait for a list of headers."""
@@ -283,10 +358,6 @@ class Address(SimplifiedPaymentVerification):
                 if txo.pubkey == self.pubkey:
                     self._register_incoming_tx(proof_data.tx)
 
-    def send_tx(self, tx: Transaction, addr):
-        """Send a new transaction to a miner for inclusion in the blockchain."""
-        NotImplemented
-
     def __getitem__(self, key):
         return self._my_utxo[key]
 
@@ -300,7 +371,7 @@ class Address(SimplifiedPaymentVerification):
         return sha256_hash(self.pubkey)
 
 
-class Miner:
+class Miner(TCPClient, TCPServer):
     def __init__(self, headers: list[BlockHeader]):
         self.address: Address = Address(headers=headers)
         self.known_full_nodes = set()
@@ -326,36 +397,23 @@ class Miner:
 
         return Block([cb_tx] + transactions, hash(self.address.headers[-1]))
 
-    @staticmethod
-    def send_block(block: Block, addr, port=9090):
-        sock = socket.socket()
-        sock.connect((addr, port))
-        sock.sendall(pickle.dumps(block))
-        sock.close()
-
     def broadcast_block(self, block):
         for addr, port in self.known_full_nodes:
-            Miner.send_block(block, addr, port)
-
-    def server_init(self, port: int):
-        """Listen for new transactions on port using TCP."""
-        # Initialize socket for new tx
-        s_tx = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s_tx.setblocking(False)
-        s_tx.bind(("", port))
-        s_tx.listen(16)
-
-        while True:
-            sock, _ = s_tx.accept()
-            tx = receive_all_pickle(sock)
-            self.handle_incoming_tx(tx)
+            sock = Miner.connect(port, addr)
+            Miner.send(sock, block)
             sock.close()
 
-    def handle_incoming_tx(self, sock):
+    def serve(self):
+        ports = { 9092: self.handle_address,
+                  9093: self.handle_new_blocks }
+        options = dict()
+        self.__serve(ports, options)
+
+    def handle_address(self, sock):
         """Add a new transaction to the list of known transactions not included in the chain."""
         NotImplemented
 
-    def listen_for_new_blocks(self, addr, port: int):
+    def handle_new_blocks(self, sock):
         """Listen for the addition of a new block to the blockchain.
         Triggers miner to stop mining current block.
 
@@ -477,8 +535,7 @@ class UTXOSet:
     def __delitem__(self, txid: TxID):
         del self._data[txid]
 
-
-class FullNode:
+class FullNode(TCPServer):
     def __init__(self, blockchain: BlockChain = None):
         self.blockchain: BlockChain = blockchain or BlockChain()
         self.UTXO_set: UTXOSet = UTXOSet(self.blockchain)
@@ -538,36 +595,13 @@ class FullNode:
 
         return response
 
-    def server_init(self, miner_port=9090, address_port=9091):
-        """Initialize a server listening for the publication of new blocks
-        on port miner_port and for requests for proofs of the inclusion of
-        transactions in new blocks.
+    def serve(self):
+        ports = { 9090: self.handle_miner,
+                  9091: self.handle_address }
+        options = dict()
+        self.__serve(ports, options)
 
-        """
-        assert(miner_port != address_port)
-
-        # Initialize socket for new blocks
-        s_miner = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s_miner.setblocking(False)
-        s_miner.bind(("", miner_port))
-        s_miner.listen(16)
-
-        # Initialize socket for proof requests
-        s_address = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s_address.setblocking(False)
-        s_address.bind(("", address_port))
-        s_address.listen(16)
-
-        while True:
-            notified_sockets = select.select([s_miner, s_address], [], [])[0]
-            for ns in notified_sockets:
-                sock, _ = ns.accept()
-                if ns == s_miner:
-                    self.handle_new_block(sock)
-                elif ns == s_address:
-                    self.handle_proof_request(sock)
-
-    def handle_proof_request(self, sock):
+    def handle_address(self, sock):
         """Reconstruct bloom filter from stream and respond with proofs."""
         bloom = receive_all_pickle(sock)
         bloom_response = self.filter_block(len(self.blockchain) - 1, bloom)
@@ -575,26 +609,10 @@ class FullNode:
         sock.send(response_data)
         sock.close()
 
-    def handle_new_block(self, sock):
+    def handle_miner(self, sock):
         """Reconstruct block from stream and add block to blockchain if valid."""
         block = receive_all_pickle(sock)
         sock.close()
         if self.validate_block(block):
             self.add_block(block)
 
-
-def receive_all_pickle(sock, MAX_TCP_MSG_SIZE=4096):
-    """Reconstruct object from pickle data recieved by stream.
-
-    Notes:
-        - must already be listening on sock
-        - does not close socket
-
-        """
-    data_list = []
-    piece = 1
-    while piece is not None:
-        piece = sock.recv(MAX_TCP_MSG_SIZE)
-        data_list.append(piece)
-
-    return pickle.loads(b''.join(data_list))
