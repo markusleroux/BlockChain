@@ -17,6 +17,7 @@ import mmh3
 from blockchain import OutputIndex, TxOutput, TxID, sha256_hash, BlockChain, BlockHeight, Block, \
     Transaction, BlockHeader, UnlockingScript, TxInput, LockingScript
 
+import logger as log
 
 @dataclass
 class ProofData:
@@ -27,6 +28,18 @@ class ProofData:
 
 BloomResponseType = dict[TxID, ProofData]
 
+
+@dataclass
+class UTXO:
+    txid: TxID
+    output_index: OutputIndex
+    value: int = field(hash=False)
+    pending: Optional[TxID] = field(default=None, init=False)  # store the txid of the spending tx
+
+    def __hash__(self):
+        return sha256_hash(reduce(operator.add, (self.txid.to_bytes(32, 'big'),
+                                                 self.output_index.to_bytes(4, 'big'),
+                                                 self.value.to_bytes(10, 'big'))))
 
 class BloomFilter:
     """Bloom filters allow for efficient descriptions of subsets of transactions.
@@ -48,10 +61,8 @@ class BloomFilter:
         for i in range(self.n_hashes):
             # Index error?
             if isinstance(item, TxID):
-                logging.info('Adding txid {} to bloom filter.'.format(str(item)))
                 self.bitarray[self.filter_hash(item.to_bytes(32, 'big'), i)] = True
             else:
-                logging.info('Adding pubkey {} to bloom filter.'.format(str(item)))
                 self.bitarray[self.filter_hash(item, i)] = True
 
     def check(self, item: Union[TxID, bytes]) -> bool:
@@ -179,8 +190,8 @@ class TCPClient(Messaging):
         sock.close()
         return response
 
-
 class SimplifiedPaymentVerification(TCPClient):
+    @log.objectID
     def __init__(self, headers: list[BlockHeader] = None, txids: set[TxID] = None, pubkeys: set[bytes] = None):
         self.headers: list[BlockHeader] = headers or list()
         self.interesting_txids: set[TxID] = txids or set()
@@ -212,6 +223,14 @@ class SimplifiedPaymentVerification(TCPClient):
 
         return bloom
 
+    def check_proofs_log_message(self, result, pd):
+        if result:
+            return f'Valid proof for txid {hash(pd.tx)}'
+        else:
+            return f'Invalid proof for txid {hash(pd.tx)}'
+
+    @log.log_object(check_proofs_log_message, level = "debug", pass_result = True)
+    @log.log_object(lambda self, pd : f'Verifying proof for txid {hash(pd.tx)}')
     def check_proofs(self, proof_data: ProofData) -> bool:
         """Check a proof against the local version of the blockchain headers"""
         # Decode the merkle_root_hash before using with merklelib
@@ -219,29 +238,25 @@ class SimplifiedPaymentVerification(TCPClient):
                                                  merklelib.Hasher(),
                                                  self.headers[proof_data.block_height].merkle_root_hash.decode())
 
-        if not result:
-            logging.info('Invalid proof for txid {}'.format(str(hash(proof_data.tx))))
-        else:
-            logging.info('Found valid proof for txid {}'.format(str(hash(proof_data.tx))))
-
         return result
 
+    # Would like to remove logging from body
     def clean_bloom_response(self, proofs: BloomResponseType) -> BloomResponseType:
         """Remove proofs which were sent due to false positives in the bloom filter"""
         interesting_proofs = set()
         for txid, proof_data in proofs.items():
             if txid in self.interesting_txids:
-                logging.info('Found interesting txid {} in proof.'.format(str(txid)))
+                self._logging_adapter.info('Found interesting txid {} in proof.'.format(str(txid)))
                 interesting_proofs.add(txid)
                 continue
 
             if any(True for txi in proof_data.tx.inputs if txi.pubkey in self.interesting_pubkeys):
-                logging.info('Found interesting txid {} in proof.'.format(str(txid)))
+                self._logging_adapter.info('Found interesting txid {} in proof.'.format(str(txid)))
                 interesting_proofs.add(txid)
                 continue
 
             if any(True for txo in proof_data.tx.outputs if txo.pubkey in self.interesting_pubkeys):
-                logging.info('Found interesting txid {} in proof.'.format(str(txid)))
+                self._logging_adapter.info('Found interesting txid {} in proof.'.format(str(txid)))
                 interesting_proofs.add(txid)
 
         return {txid: proofs[txid] for txid in interesting_proofs}
@@ -256,7 +271,6 @@ class Address(SimplifiedPaymentVerification):
         self.private_key: ecdsa.SigningKey = ecdsa.SigningKey.generate()
         self._my_utxo: dict[TxID, UTXO] = dict()
         super().__init__(headers=headers, pubkeys={self.pubkey})
-        logging.info('Address {}: created'.format(str(self.pubkey)))
 
     @property
     def wealth(self) -> int:
@@ -276,15 +290,15 @@ class Address(SimplifiedPaymentVerification):
         """Sign the byte_string with addresses private key."""
         return self.private_key.sign(byte_string)
 
+    @log.log_object(lambda self, tx : f'Registering incoming txid {hash(tx)}')
     def _register_incoming_tx(self, tx: Transaction):
         """Add all utxo in tx attributes to self.pubkey to _my_utxo"""
-        logging.info('Address {}: registering incoming txid {}'.format(str(self.pubkey), str(hash(tx))))
         for index, o in filter(lambda item: item[1].pubkey == self.pubkey, enumerate(tx.outputs)):
             self[hash(tx)] = UTXO(hash(tx), index, o.value)
 
+    @log.log_object(lambda self, txid : f'Clearing txid {txid} from personal utxo set')
     def _clear_outgoing_tx(self, txid: TxID):
         """Remove UTXO when NEXT transaction has cleared."""
-        logging.info('Address {}: clearing txid {} from personal utxo set'.format(str(self.pubkey), str(txid)))
         marked = []
         for utxo in filter(lambda utxo: utxo.pending, self._my_utxo.values()):
             if utxo.pending == txid:
@@ -309,6 +323,7 @@ class Address(SimplifiedPaymentVerification):
 
         return gathered_utxo, abs(remaining_value)
 
+    @log.log_object(lambda self, tx, value, rpk, txt : f'Created tx {hash(tx)} with value {value} and receiver {rpk}', pass_result = True)
     def create_transaction(self, value: int, receiver_pubkey: bytes, tx_type: str = 'p2pk') -> Transaction:
         """Return a transaction sending value amount to receiver_pubkey address."""
         inputs, outputs = [], []
@@ -332,11 +347,6 @@ class Address(SimplifiedPaymentVerification):
         for utxo in gathered_utxo:
             utxo.pending = hash(tx)
 
-        logging.info('Address {}: created tx {} with value {} and receiver {}'.format(str(self.pubkey),
-                                                                                      str(hash(tx)),
-                                                                                      str(value),
-                                                                                      str(receiver_pubkey)))
-
         return tx
 
     def process_proofs(self, proofs: BloomResponseType):
@@ -347,7 +357,6 @@ class Address(SimplifiedPaymentVerification):
         """
         for txid, proof_data in self.clean_bloom_response(proofs).items():
             if not self.check_proofs(proof_data):
-                print('proof for txid {} invalid'.format(txid))
                 continue
 
             for txi in proof_data.tx.inputs:
@@ -372,11 +381,13 @@ class Address(SimplifiedPaymentVerification):
 
 
 class Miner(TCPClient, TCPServer):
+    @log.objectID
     def __init__(self, headers: list[BlockHeader]):
         self.address: Address = Address(headers=headers)
         self.known_full_nodes = set()
         self.known_tx = []
 
+    @log.log_object(lambda self, rpk, value, txt : f'Created coinbase tx with value {value} and receiver {rpk}')
     def create_coinbase_tx(self, receiver_pubkey, value, tx_type='p2pk'):
         """Create a coinbase transaction."""
         # we use our own private/public key for type checking, but anything is valid
@@ -388,6 +399,7 @@ class Miner(TCPClient, TCPServer):
 
         return Transaction([tx_input], [tx_output])
 
+    @log.log_object(lambda self, txs : f'Created block with {len(txs)} transactions')
     def create_block(self, transactions: list[Transaction]) -> Block:
         """Create a new block from a list of transactions."""
         cb_tx: Transaction = self.create_coinbase_tx(self.address.pubkey, 50)
@@ -426,18 +438,6 @@ class UTXOinBlock:
     block_height: int
     output_dict: dict[OutputIndex, TxOutput]
 
-
-@dataclass
-class UTXO:
-    txid: TxID
-    output_index: OutputIndex
-    value: int = field(hash=False)
-    pending: Optional[TxID] = field(default=None, init=False)  # store the txid of the spending tx
-
-    def __hash__(self):
-        return sha256_hash(reduce(operator.add, (self.txid.to_bytes(32, 'big'),
-                                                 self.output_index.to_bytes(4, 'big'),
-                                                 self.value.to_bytes(10, 'big'))))
 
 
 class UTXOSet:
@@ -536,14 +536,18 @@ class UTXOSet:
         del self._data[txid]
 
 class FullNode(TCPServer):
+    @log.objectID
     def __init__(self, blockchain: BlockChain = None):
         self.blockchain: BlockChain = blockchain or BlockChain()
         self.UTXO_set: UTXOSet = UTXOSet(self.blockchain)
 
+    @log.log_object(lambda self, block : f'Adding block to blockchain')
     def add_block(self, block: Block):
         self.UTXO_set.update(block)
         self.blockchain.add_block(block)
 
+    @log.log_object(lambda self, result, block : f'Validated block' if result else f'Invalidated block', pass_result = True)
+    @log.log_object(lambda self, block : f'Validating block')
     def validate_block(self, block: Block) -> bool:
         """Validate a new block.
 
@@ -571,6 +575,13 @@ class FullNode(TCPServer):
 
         return True
 
+    def filter_tx_log_message(self, result, tx, bloom):
+        if result:
+            return f'Transaction {hash(tx)} matched against filter'
+        else:
+            return f'Transaction {hash(tx)} did not match against filter', 
+
+    @log.log_object(filter_tx_log_message, level = 'debug', pass_result = True)
     @staticmethod
     def filter_tx(tx: Transaction, bloom: BloomFilter) -> bool:
         """Return True if and only if tx is matches against the bloom filter"""

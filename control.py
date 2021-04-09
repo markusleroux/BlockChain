@@ -101,5 +101,6 @@ class NetworkControl:
             self.simulate_query_round()
 
 
-nc = NetworkControl(20, 5, 1)
-nc.simulate_n_rounds(9)
+if __name__ == '__main__':
+    nc = NetworkControl(20, 5, 1)
+    nc.simulate_n_rounds(9)
